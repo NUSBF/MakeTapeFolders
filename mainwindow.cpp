@@ -221,6 +221,11 @@ QPushButton#pushButtonStart:disabled{ background: #2a3a2a; border-color: #3a4a3a
 QPushButton#pushButtonStop          { background: #f38ba8; color: #1e1e2e; font-weight: bold; }
 QPushButton#pushButtonStop:disabled { background: #2a1a1e; border-color: #3a2a2e; color: #6e4855; }
 
+QPushButton#pushButtonUseSqlite:checked, QPushButton#pushButtonUseMariaDb:checked,
+QPushButton#pushButtonLimitByTar:checked, QPushButton#pushButtonLimitByLtfs:checked {
+    background: #a6e3a1; color: #1e1e2e; border: 1px solid #a6e3a1; font-weight: bold;
+}
+
 QGroupBox { border: 1px solid #313244; border-radius: 5px; margin-top: 14px;
             background: #1e1e2e; color: #cdd6f4; }
 QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left;
@@ -254,7 +259,6 @@ QLabel#labelQueueDetail, QLabel#labelWriteDetail { color: #a6adc8; font-size: 10
 QLabel#labelBackupStatus { color: #89b4fa; font-size: 10pt; }
 QLabel#labelStats { color: #a6adc8; font-size: 9pt; font-family: monospace; }
 QLabel#labelScanStatus { color: #a6adc8; }
-QLabel#labelLtfsOverheadWarning { color: #fab387; font-style: italic; font-size: 9pt; }
 QLabel#labelStopWarning {
     color: #f38ba8; font-size: 11pt; font-weight: bold;
     background: #3a0a0a; border: 1px solid #f38ba8; border-radius: 3px; padding: 4px 8px;

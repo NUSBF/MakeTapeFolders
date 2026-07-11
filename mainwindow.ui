@@ -120,22 +120,18 @@
     <property name="text"><string>Tar</string></property>
     <property name="checkable"><bool>true</bool></property>
    </widget>
-   <widget class="QPushButton" name="pushButtonLimitByLtfs">
-    <property name="geometry"><rect><x>220</x><y>158</y><width>90</width><height>26</height></rect></property>
-    <property name="text"><string>LTFS</string></property>
-    <property name="checkable"><bool>true</bool></property>
-   </widget>
    <widget class="QLabel" name="labelLtfsOverheadLbl">
-    <property name="geometry"><rect><x>330</x><y>162</y><width>230</width><height>22</height></rect></property>
+    <property name="geometry"><rect><x>225</x><y>162</y><width>230</width><height>22</height></rect></property>
     <property name="text"><string>LTFS index overhead/file (bytes):</string></property>
    </widget>
    <widget class="QLineEdit" name="lineEditLtfsOverhead">
-    <property name="geometry"><rect><x>565</x><y>158</y><width>80</width><height>24</height></rect></property>
+    <property name="geometry"><rect><x>460</x><y>158</y><width>80</width><height>24</height></rect></property>
     <property name="text"><string>1024</string></property>
    </widget>
-   <widget class="QLabel" name="labelLtfsOverheadWarning">
-    <property name="geometry"><rect><x>655</x><y>162</y><width>560</width><height>22</height></rect></property>
-    <property name="text"><string>unmeasured placeholder — recalibrate from a real df before/after a tape write</string></property>
+   <widget class="QPushButton" name="pushButtonLimitByLtfs">
+    <property name="geometry"><rect><x>550</x><y>158</y><width>90</width><height>26</height></rect></property>
+    <property name="text"><string>LTFS</string></property>
+    <property name="checkable"><bool>true</bool></property>
    </widget>
 
    <!-- ============================================================ -->
