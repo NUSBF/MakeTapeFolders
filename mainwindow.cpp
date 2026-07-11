@@ -26,14 +26,7 @@
 #include <thread>
 #include <chrono>
 
-#include "db/DbSync.h"
-
-// ---------------------------------------------------------------------------
-// Active database backend — flip to MariaDb once the SQLite data is
-// confirmed fully migrated (via the "Sync SQLite -> MariaDB" button).
-// ---------------------------------------------------------------------------
-
-static constexpr DbBackend::Kind kActiveBackend = DbBackend::Kind::Sqlite;
+#include "dbconfigdialog.h"
 
 // ---------------------------------------------------------------------------
 // runBackup() phase tracking — read by initiateShutdown() so its status
@@ -158,15 +151,8 @@ MainWindow::MainWindow(QWidget *parent)
     if (settings.contains("geometry")) restoreGeometry(settings.value("geometry").toByteArray());
     qDebug() << "[INIT 2] setupUi done";
 
-    qDebug() << "[INIT 3] opening DB backend:"
-             << (kActiveBackend == DbBackend::Kind::Sqlite ? "Sqlite" : "MariaDb");
-
-    m_db = std::make_unique<DbBackend>(kActiveBackend);
-    QString dbErr;
-    if (!m_db->ensureSchema(&dbErr)) {
-        QMessageBox::critical(this, "DB Error", "Cannot open session database:\n" + dbErr);
-        m_db.reset();
-    }
+    qDebug() << "[INIT 3] opening active DB backend…";
+    openActiveBackendOrExit();
     qDebug() << "[INIT 9] schema ready";
 
     qDebug() << "[INIT 13] restoring QSettings…";
@@ -259,6 +245,7 @@ QProgressBar#progressBarShutdown::chunk { background: #f38ba8; border-radius: 3p
 )");
 
     on_lineEditMaxSize_textChanged(ui->lineEditMaxSize->text());
+    updateBackendButtons();
 
     // Start is disabled in the .ui file — only enabled when DB stats query finishes
     m_dbLoadTimer.start();
@@ -286,7 +273,6 @@ MainWindow::~MainWindow()
     QThreadPool::globalInstance()->waitForDone(3000);     // let DB bg tasks exit
     if (scanFuture.isRunning())   scanFuture.waitForFinished();
     if (backupFuture.isRunning()) backupFuture.waitForFinished();
-    if (syncFuture.isRunning())   syncFuture.waitForFinished();
     if (m_db) m_db->closeThreadConnection();               // this (GUI) thread's connection
     m_db.reset();
     delete ui;
@@ -602,8 +588,8 @@ void MainWindow::runScan(const QString& scanRoot, const QString& sourceRoot)
         QMetaObject::invokeMethod(ui->pushButtonScanSource,     [this,en]{ ui->pushButtonScanSource->setEnabled(en); },     Qt::QueuedConnection);
         QMetaObject::invokeMethod(ui->pushButtonScanSubfolder,  [this,en]{ ui->pushButtonScanSubfolder->setEnabled(en); },  Qt::QueuedConnection);
         QMetaObject::invokeMethod(ui->pushButtonStart,          [this,en]{ ui->pushButtonStart->setEnabled(en); },          Qt::QueuedConnection);
-        QMetaObject::invokeMethod(ui->pushButtonSyncToMariaDb,  [this,en]{ ui->pushButtonSyncToMariaDb->setEnabled(en); },  Qt::QueuedConnection);
-        QMetaObject::invokeMethod(ui->pushButtonSyncToSqlite,   [this,en]{ ui->pushButtonSyncToSqlite->setEnabled(en); },   Qt::QueuedConnection);
+        QMetaObject::invokeMethod(ui->pushButtonUseSqlite,      [this,en]{ ui->pushButtonUseSqlite->setEnabled(en); },      Qt::QueuedConnection);
+        QMetaObject::invokeMethod(ui->pushButtonUseMariaDb,     [this,en]{ ui->pushButtonUseMariaDb->setEnabled(en); },     Qt::QueuedConnection);
     };
     auto setStatus = [this](const QString& s) {
         QMetaObject::invokeMethod(ui->labelScanStatus, [this,s]{ ui->labelScanStatus->setText(s); }, Qt::QueuedConnection);
@@ -813,8 +799,8 @@ void MainWindow::on_pushButtonStart_clicked()
     ui->pushButtonDest->setEnabled(false);
     ui->pushButtonScanSource->setEnabled(false);
     ui->pushButtonScanSubfolder->setEnabled(false);
-    ui->pushButtonSyncToMariaDb->setEnabled(false);
-    ui->pushButtonSyncToSqlite->setEnabled(false);
+    ui->pushButtonUseSqlite->setEnabled(false);
+    ui->pushButtonUseMariaDb->setEnabled(false);
     ui->labelBackupStatus->setText("Starting…");
     ui->progressBarBackup->setValue(0);
     ui->progressBarBackup->setMaximum(100);
@@ -922,8 +908,8 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
             ui->pushButtonDest->setEnabled(true);
             ui->pushButtonScanSource->setEnabled(true);
             ui->pushButtonScanSubfolder->setEnabled(true);
-            ui->pushButtonSyncToMariaDb->setEnabled(true);
-            ui->pushButtonSyncToSqlite->setEnabled(true);
+            ui->pushButtonUseSqlite->setEnabled(true);
+            ui->pushButtonUseMariaDb->setEnabled(true);
             if (m_pipelineTimer) {
                 m_pipelineTimer->stop();
                 m_pipelineTimer->deleteLater();
@@ -2168,68 +2154,84 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
 }
 
 // ---------------------------------------------------------------------------
-// Sync: SQLite <-> MariaDB (safe-keeping / migration). Opens both backends
-// explicitly regardless of which one is "active" (kActiveBackend above).
+// Active database backend — persisted choice (default MariaDb), selected via
+// the two mutually-exclusive backend buttons. Switching (or first startup)
+// opens DbConfigDialog for connection details/creation/reconciliation.
 // ---------------------------------------------------------------------------
 
-void MainWindow::on_pushButtonSyncToMariaDb_clicked()
+static constexpr const char* kActiveBackendSettingsKey = "db/activeBackend";
+
+void MainWindow::openActiveBackendOrExit()
 {
-    runSync(DbBackend::Kind::Sqlite, DbBackend::Kind::MariaDb);
+    QString saved = settings.value(kActiveBackendSettingsKey, "mariadb").toString();
+    DbBackend::Kind kind = (saved == "sqlite") ? DbBackend::Kind::Sqlite : DbBackend::Kind::MariaDb;
+
+    m_db = std::make_unique<DbBackend>(kind);
+    QString dbErr;
+    if (!m_db->ensureSchema(&dbErr)) {
+        // Never proceed with a broken/absent DB connection — this app's
+        // entire purpose is tracking a 682TB archive job against this DB;
+        // continuing with m_db == nullptr previously just meant every
+        // subsequent operation silently no-op'd or crashed later instead of
+        // failing clearly right here.
+        QMessageBox::critical(this, "Database connection failed",
+            QString("Cannot connect to the active database backend (%1):\n\n%2\n\n"
+                    "The application cannot continue without a working database "
+                    "connection and will now exit.")
+                .arg(kind == DbBackend::Kind::Sqlite ? "SQLite" : "MariaDB")
+                .arg(dbErr));
+        qDebug() << "[INIT] FATAL: active backend connection failed:" << dbErr;
+        ::exit(1);
+    }
 }
 
-void MainWindow::on_pushButtonSyncToSqlite_clicked()
+void MainWindow::switchActiveBackend(DbBackend::Kind kind)
 {
-    runSync(DbBackend::Kind::MariaDb, DbBackend::Kind::Sqlite);
+    settings.setValue(kActiveBackendSettingsKey, kind == DbBackend::Kind::Sqlite ? "sqlite" : "mariadb");
+
+    if (m_db) m_db->closeThreadConnection();
+    m_db = std::make_unique<DbBackend>(kind);
+    QString dbErr;
+    if (!m_db->ensureSchema(&dbErr)) {
+        QMessageBox::critical(this, "Database connection failed",
+            "Cannot connect to the selected backend:\n" + dbErr);
+        m_db.reset();
+    }
+    updateBackendButtons();
+    populateSourceRoots();
 }
 
-void MainWindow::runSync(DbBackend::Kind fromKind, DbBackend::Kind toKind)
+void MainWindow::updateBackendButtons()
 {
-    if (scanFuture.isRunning() || backupFuture.isRunning()) {
-        QMessageBox::information(this, "Sync", "Wait for the current scan/backup to finish first.");
+    bool isSqlite = m_db && m_db->kind() == DbBackend::Kind::Sqlite;
+    ui->pushButtonUseSqlite->setChecked(isSqlite);
+    ui->pushButtonUseMariaDb->setChecked(!isSqlite);
+}
+
+void MainWindow::on_pushButtonUseSqlite_clicked()
+{
+    if (m_db && m_db->kind() == DbBackend::Kind::Sqlite) {
+        updateBackendButtons(); // already active, keep it checked
         return;
     }
-    if (syncFuture.isRunning()) {
-        QMessageBox::information(this, "Sync", "A sync is already in progress.");
+    DbConfigDialog dlg(this);
+    if (dlg.exec() == QDialog::Accepted && dlg.hasRequestedBackendSwitch()) {
+        switchActiveBackend(dlg.requestedBackendKind());
+    } else {
+        updateBackendButtons(); // dialog cancelled — revert the button check state
+    }
+}
+
+void MainWindow::on_pushButtonUseMariaDb_clicked()
+{
+    if (m_db && m_db->kind() == DbBackend::Kind::MariaDb) {
+        updateBackendButtons();
         return;
     }
-
-    ui->pushButtonSyncToMariaDb->setEnabled(false);
-    ui->pushButtonSyncToSqlite->setEnabled(false);
-    ui->pushButtonStart->setEnabled(false);
-    ui->pushButtonScanSource->setEnabled(false);
-    ui->pushButtonScanSubfolder->setEnabled(false);
-    stopRequested.store(false);
-    ui->labelScanStatus->setText("Sync starting…");
-
-    syncFuture = QtConcurrent::run([this, fromKind, toKind]() {
-        auto from = std::make_unique<DbBackend>(fromKind);
-        auto to   = std::make_unique<DbBackend>(toKind);
-        QString err;
-        if (!from->ensureSchema(&err) || !to->ensureSchema(&err)) {
-            QString e = err;
-            QMetaObject::invokeMethod(this, [this, e] {
-                ui->labelScanStatus->setText("Sync FAILED: " + e);
-            }, Qt::QueuedConnection);
-        } else {
-            DbSync::syncAll(*from, *to, [this](const DbSync::Progress& p) {
-                QMetaObject::invokeMethod(this, [this, p] {
-                    ui->labelScanStatus->setText(
-                        QString("Syncing… %1 files, %2 done-records copied")
-                            .arg(p.filesCopied).arg(p.doneCopied));
-                }, Qt::QueuedConnection);
-            }, stopRequested);
-        }
-        from->closeThreadConnection();
-        to->closeThreadConnection();
-
-        QMetaObject::invokeMethod(this, [this] {
-            ui->pushButtonSyncToMariaDb->setEnabled(true);
-            ui->pushButtonSyncToSqlite->setEnabled(true);
-            ui->pushButtonStart->setEnabled(true);
-            ui->pushButtonScanSource->setEnabled(true);
-            ui->pushButtonScanSubfolder->setEnabled(true);
-            ui->labelScanStatus->setText("Sync complete.");
-            populateSourceRoots();
-        }, Qt::QueuedConnection);
-    });
+    DbConfigDialog dlg(this);
+    if (dlg.exec() == QDialog::Accepted && dlg.hasRequestedBackendSwitch()) {
+        switchActiveBackend(dlg.requestedBackendKind());
+    } else {
+        updateBackendButtons();
+    }
 }

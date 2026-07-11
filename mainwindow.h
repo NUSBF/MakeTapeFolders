@@ -34,14 +34,21 @@ private slots:
     void on_pushButtonStart_clicked();
     void on_pushButtonStop_clicked();
 
-    void on_pushButtonSyncToMariaDb_clicked();
-    void on_pushButtonSyncToSqlite_clicked();
+    void on_pushButtonUseSqlite_clicked();
+    void on_pushButtonUseMariaDb_clicked();
 
 private:
     void runScan(const QString& scanRoot, const QString& sourceRoot);
     void runBackup(const QString& prefix, qint64 maxFolderSize);
     void populateSourceRoots();
-    void runSync(DbBackend::Kind fromKind, DbBackend::Kind toKind);
+
+    // Opens the currently-active backend (per QSettings, defaulting to
+    // MariaDb) and connects. If it fails, per the "never fail silently"
+    // rule: show a critical error and terminate the app rather than limp
+    // along with m_db == nullptr.
+    void openActiveBackendOrExit();
+    void switchActiveBackend(DbBackend::Kind kind);
+    void updateBackendButtons();
 
     void closeEvent(QCloseEvent* event) override;
     void initiateShutdown();
@@ -54,7 +61,6 @@ private:
 
     QFuture<void> scanFuture;
     QFuture<void> backupFuture;
-    QFuture<void> syncFuture;
     std::atomic<bool> stopRequested{false};
     std::atomic<bool> forceKillWriter{false};
     bool m_shuttingDown = false;

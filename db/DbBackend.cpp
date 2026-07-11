@@ -7,26 +7,8 @@
 #include <QMutexLocker>
 #include <QSqlError>
 
-namespace {
-
-// ---------------------------------------------------------------------------
-// Connection parameters — hardcoded for now, matching the "keep it simple"
-// scope for the constructor-level backend preference. A settings dialog can
-// replace this later.
-// ---------------------------------------------------------------------------
-constexpr const char* kSqlitePath = "/home/data/raw4/Tape/session.db";
-
-constexpr const char* kMariaHost = "localhost";
-constexpr int         kMariaPort = 3306;
-constexpr const char* kMariaDb   = "maketapefolders";
-constexpr const char* kMariaUser = "maketapefolders";
-// Password is deliberately NOT hardcoded here (this file lives in the repo).
-// Read from the environment at connect time instead — see openConnection().
-constexpr const char* kMariaPassEnvVar = "MTF_MARIADB_PASSWORD";
-
-} // namespace
-
-DbBackend::DbBackend(Kind kind) : m_kind(kind) {}
+DbBackend::DbBackend(Kind kind, ConnectionConfig config)
+    : m_kind(kind), m_config(std::move(config)) {}
 
 DbBackend::~DbBackend()
 {
@@ -73,22 +55,20 @@ QString DbBackend::connectionNameForCurrentThread()
 bool DbBackend::openConnection(QSqlDatabase& db, QString* errorOut)
 {
     if (m_kind == Kind::Sqlite) {
-        // Explicit test/dev override only — never a silent fallback. Unset
-        // in normal operation, where kSqlitePath is always used.
-        QString path = qEnvironmentVariable("MTF_SQLITE_PATH_OVERRIDE", kSqlitePath);
-        QDir().mkpath(QFileInfo(path).path());
-        db.setDatabaseName(path);
+        QDir().mkpath(QFileInfo(m_config.sqlitePath).path());
+        db.setDatabaseName(m_config.sqlitePath);
     } else {
-        if (!qEnvironmentVariableIsSet(kMariaPassEnvVar)) {
-            if (errorOut) *errorOut = QString("%1 is not set in the environment — "
-                "refusing to connect rather than guessing a password.").arg(kMariaPassEnvVar);
+        if (m_config.mariaPass.isEmpty()) {
+            if (errorOut) *errorOut = "MariaDB password is not set — refusing to connect "
+                "rather than guessing one. Set MTF_MARIADB_PASSWORD in the environment, or "
+                "in ~/.config/MakeTapeFolders/mariadb.env (chmod 600).";
             return false;
         }
-        db.setHostName(kMariaHost);
-        db.setPort(kMariaPort);
-        db.setDatabaseName(kMariaDb);
-        db.setUserName(kMariaUser);
-        db.setPassword(qEnvironmentVariable(kMariaPassEnvVar));
+        db.setHostName(m_config.mariaHost);
+        db.setPort(m_config.mariaPort);
+        db.setDatabaseName(m_config.mariaDb);
+        db.setUserName(m_config.mariaUser);
+        db.setPassword(m_config.mariaPass);
     }
     if (!db.open()) {
         if (errorOut) *errorOut = db.lastError().text();
@@ -406,6 +386,41 @@ bool DbBackend::ensureSchema(QString* errorOut)
         createSchemaMariaDb(db);
     }
     return true;
+}
+
+DbState DbBackend::currentState()
+{
+    DbState state;
+    QSqlDatabase db = connection();
+    if (!db.isOpen()) {
+        state.connected = false;
+        state.connectError = db.lastError().text();
+        return state;
+    }
+    state.connected = true;
+
+    // Check schema existence without creating it — ensureSchema() would
+    // create tables, defeating the point of an accurate "what's actually
+    // there right now" snapshot.
+    QSqlQuery chk(db);
+    if (m_kind == Kind::Sqlite) {
+        chk.exec("SELECT 1 FROM sqlite_master WHERE type='table' AND name='files'");
+    } else {
+        chk.prepare("SELECT 1 FROM information_schema.tables "
+                    "WHERE table_schema = DATABASE() AND table_name = 'files'");
+        chk.exec();
+    }
+    state.schemaExists = chk.next();
+    if (!state.schemaExists) return state;
+
+    QSqlQuery q(db);
+    if (q.exec("SELECT COUNT(*) FROM files") && q.next())
+        state.filesCount = q.value(0).toLongLong();
+    if (q.exec("SELECT COUNT(*) FROM done") && q.next())
+        state.doneCount = q.value(0).toLongLong();
+    if (q.exec("SELECT MAX(scanned_at) FROM files") && q.next())
+        state.lastScannedAt = q.value(0).toLongLong();
+    return state;
 }
 
 // ---------------------------------------------------------------------------

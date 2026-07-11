@@ -18,6 +18,8 @@ set(PROJECT_SOURCES
         mainwindow.cpp
         mainwindow.h
         mainwindow.ui
+        dbconfigdialog.h
+        dbconfigdialog.cpp
         db/DbTypes.h
         db/DbBackend.h
         db/DbBackend.cpp

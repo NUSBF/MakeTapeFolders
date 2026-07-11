@@ -23,8 +23,17 @@ class DbBackend
 public:
     enum class Kind { Sqlite, MariaDb };
 
-    explicit DbBackend(Kind kind);
+    // Uses ConnectionConfig::load() (QSettings-persisted) if no config is
+    // given explicitly — pass one explicitly to test/create a connection
+    // with different parameters than the currently-saved ones (e.g. from
+    // the config dialog) without touching the persisted settings.
+    explicit DbBackend(Kind kind, ConnectionConfig config = ConnectionConfig::load());
     ~DbBackend();
+
+    // Snapshot of what's actually in this database right now — connects if
+    // needed, checks schema, counts rows. Safe to call even if the schema
+    // has never been created (schemaExists will just be false).
+    DbState currentState();
 
     // Opens (or reuses) the connection for the calling thread, creates the
     // schema if missing, and migrates an existing SQLite DB that predates the
@@ -119,6 +128,7 @@ private:
     QSqlQuery* cachedStmt(QMap<QThread*, QSqlQuery*>& cache, const QString& sql);
 
     Kind m_kind;
+    ConnectionConfig m_config;
     QMutex m_mutex;
     QMap<QThread*, QString> m_connNames;             // calling thread -> unique QSqlDatabase connection name
     QMap<QThread*, QSqlQuery*> m_doneInsertStmt;     // per-thread prepared INSERT for insertDone()
