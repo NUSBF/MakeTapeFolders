@@ -16,6 +16,11 @@ QT_BEGIN_NAMESPACE
 namespace Ui { class MainWindow; }
 QT_END_NAMESPACE
 
+// Which capacity model governs folder rotation. Both models are always
+// computed regardless of which is active — see mainwindow.cpp's
+// tarFileBytes()/ltfsFileBytes().
+enum class HardLimitModel { Tar, Ltfs };
+
 class MainWindow : public QMainWindow
 {
     Q_OBJECT
@@ -37,9 +42,13 @@ private slots:
     void on_pushButtonUseSqlite_clicked();
     void on_pushButtonUseMariaDb_clicked();
 
+    void on_pushButtonLimitByTar_clicked();
+    void on_pushButtonLimitByLtfs_clicked();
+    void on_lineEditLtfsOverhead_textChanged(const QString &arg1);
+
 private:
     void runScan(const QString& scanRoot, const QString& sourceRoot);
-    void runBackup(const QString& prefix, qint64 maxFolderSize);
+    void runBackup(const QString& prefix, qint64 maxFolderSize, qint64 ltfsIndexOverheadBytes);
     void populateSourceRoots();
 
     // Opens the currently-active backend (per QSettings, defaulting to
@@ -49,6 +58,9 @@ private:
     void openActiveBackendOrExit();
     void switchActiveBackend(DbBackend::Kind kind);
     void updateBackendButtons();
+
+    void setHardLimitModel(HardLimitModel m);
+    void updateHardLimitButtons();
 
     void closeEvent(QCloseEvent* event) override;
     void initiateShutdown();
@@ -74,6 +86,13 @@ private:
     // that's only true once Phase 3 (the write pipeline) has actually
     // started. See BackupPhase in mainwindow.cpp.
     std::atomic<int> currentBackupPhase{0};
+
+    // Which capacity model gates folder rotation right now — GUI thread
+    // writes it (via the Tar/LTFS toggle buttons), the writer thread reads
+    // it once per file in the rotation check. Safe to flip mid-run: both
+    // models' running totals are kept up to date continuously regardless of
+    // which one is active.
+    std::atomic<HardLimitModel> activeHardLimitModel{HardLimitModel::Tar};
 
     QTimer*       m_pipelineTimer   = nullptr;
     QTimer*       m_dbLoadDispTimer = nullptr;

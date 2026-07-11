@@ -89,15 +89,32 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// Per-file on-tape bytes when written with tar (always >= LTFS, so staying
-// under 12 TB with this number guarantees fit on tape for both tar and LTFS).
-//   tar:  512 header + data rounded up to 512-byte boundary
-//   LTFS: just the file size — always less than tarFileBytes()
+// Two independent on-tape capacity models, both computed for every file:
+//   tar:  512-byte header + data rounded up to a 512-byte boundary (models a
+//         tar stream, padded once at the very end to an LTO block).
+//   LTFS: each file's data block-aligned individually (LTFS is a real
+//         filesystem on block-addressable media, unlike a tar byte stream)
+//         plus a per-file index/metadata overhead constant. The block
+//         constant is reused from tar's own LTO-block rounding; the index
+//         overhead is the genuinely uncertain part and is a user-editable,
+//         QSettings-persisted value (see lineEditLtfsOverhead) rather than a
+//         hardcoded guess — recalibrate it from a real df-before/after
+//         measurement on an actual tape write.
+// Neither model is assumed to bound the other — a folder proven to fit under
+// one estimate is not guaranteed to fit under the other.
 // ---------------------------------------------------------------------------
+
+static constexpr qint64 kLtoBlockBytes = 524288; // 512 KiB LTO block
 
 static qint64 tarFileBytes(qint64 fileSize)
 {
     return 512 + ((fileSize + 511) / 512) * 512;
+}
+
+static qint64 ltfsFileBytes(qint64 fileSize, qint64 ltfsIndexOverheadBytes)
+{
+    qint64 dataBlocks = ((fileSize + kLtoBlockBytes - 1) / kLtoBlockBytes) * kLtoBlockBytes;
+    return dataBlocks + ltfsIndexOverheadBytes;
 }
 
 // Gzip validation — checks magic header + ISIZE footer.
@@ -116,26 +133,36 @@ static bool isValidGzip(const QString& path, qint64 expectedOriginalSize = -1)
     return isize == (quint32)(expectedOriginalSize & 0xFFFFFFFF);
 }
 
-// Scan existing folder and return {actualBytes, tarBytes} for resume.
-// tarBytes = EOA(1024) + per-file tar overhead, aligned to 512 KB LTO block.
-static QPair<qint64,qint64> folderSizes(const QString& folderPath)
+// Scan existing folder and return raw/tar/LTFS byte totals for resume.
+struct FolderSizes {
+    qint64 actualBytes = 0; // raw sum of file sizes — informational only, never a hard limit
+    qint64 tarBytes    = 1024;
+    qint64 ltfsBytes   = 0;
+};
+
+static FolderSizes folderSizes(const QString& folderPath, qint64 ltfsIndexOverheadBytes)
 {
-    qint64 actual = 0, tar = 1024;
-    if (!QDir(folderPath).exists()) return {actual, tar};
+    FolderSizes fs;
+    if (!QDir(folderPath).exists()) return fs;
     QDirIterator it(folderPath,
                     QDir::Files | QDir::NoSymLinks | QDir::NoDotAndDotDot,
                     QDirIterator::Subdirectories);
     while (it.hasNext()) {
         it.next();
         qint64 sz = it.fileInfo().size();
-        actual += sz;
-        tar    += tarFileBytes(sz);
+        fs.actualBytes += sz;
+        fs.tarBytes    += tarFileBytes(sz);
+        fs.ltfsBytes   += ltfsFileBytes(sz, ltfsIndexOverheadBytes);
     }
-    const qint64 block = 524288;
-    tar = ((tar + block - 1) / block) * block;
-    return {actual, tar};
+    fs.tarBytes = ((fs.tarBytes + kLtoBlockBytes - 1) / kLtoBlockBytes) * kLtoBlockBytes;
+    // Not applying the same rounding to ltfsBytes — that models tar's own
+    // end-of-archive padding, which has no LTFS equivalent; every file's
+    // contribution to ltfsBytes is already block-aligned individually.
+    return fs;
 }
 
+static constexpr const char* kHardLimitModelSettingsKey = "hardLimitModel";
+static constexpr const char* kLtfsOverheadSettingsKey   = "ltfsIndexOverheadBytes";
 
 // ---------------------------------------------------------------------------
 // Constructor
@@ -165,6 +192,11 @@ MainWindow::MainWindow(QWidget *parent)
         if (!dest.isEmpty()) { destinationdir.setPath(dest); ui->labelDest->setText(dest); }
         ui->lineEditPrefix->setText(pfx);
         ui->lineEditMaxSize->setText(maxSz);
+
+        ui->lineEditLtfsOverhead->setText(settings.value(kLtfsOverheadSettingsKey, "1024").toString());
+        QString hlm = settings.value(kHardLimitModelSettingsKey, "tar").toString();
+        activeHardLimitModel.store(hlm == "ltfs" ? HardLimitModel::Ltfs : HardLimitModel::Tar);
+        updateHardLimitButtons();
     }
     qDebug() << "[INIT 14] QSettings done";
 
@@ -222,6 +254,7 @@ QLabel#labelQueueDetail, QLabel#labelWriteDetail { color: #a6adc8; font-size: 10
 QLabel#labelBackupStatus { color: #89b4fa; font-size: 10pt; }
 QLabel#labelStats { color: #a6adc8; font-size: 9pt; font-family: monospace; }
 QLabel#labelScanStatus { color: #a6adc8; }
+QLabel#labelLtfsOverheadWarning { color: #fab387; font-style: italic; font-size: 9pt; }
 QLabel#labelStopWarning {
     color: #f38ba8; font-size: 11pt; font-weight: bold;
     background: #3a0a0a; border: 1px solid #f38ba8; border-radius: 3px; padding: 4px 8px;
@@ -792,6 +825,14 @@ void MainWindow::on_pushButtonStart_clicked()
     }
     qint64 maxFolderSize = (qint64)(tb * 1000000000000LL);
 
+    bool okOverhead;
+    qint64 ltfsIndexOverheadBytes = ui->lineEditLtfsOverhead->text().toLongLong(&okOverhead);
+    if (!okOverhead || ltfsIndexOverheadBytes < 0 || ltfsIndexOverheadBytes > 1048576) {
+        QMessageBox::critical(this, "Error",
+            "Invalid LTFS index overhead — enter a non-negative integer number of bytes (max 1048576).");
+        return;
+    }
+
     stopRequested.store(false);
     ui->pushButtonStart->setEnabled(false);
     ui->pushButtonStop->setEnabled(true);
@@ -801,12 +842,13 @@ void MainWindow::on_pushButtonStart_clicked()
     ui->pushButtonScanSubfolder->setEnabled(false);
     ui->pushButtonUseSqlite->setEnabled(false);
     ui->pushButtonUseMariaDb->setEnabled(false);
+    ui->lineEditLtfsOverhead->setEnabled(false);
     ui->labelBackupStatus->setText("Starting…");
     ui->progressBarBackup->setValue(0);
     ui->progressBarBackup->setMaximum(100);
 
-    backupFuture = QtConcurrent::run([this, prefix, maxFolderSize]() {
-        runBackup(prefix, maxFolderSize);
+    backupFuture = QtConcurrent::run([this, prefix, maxFolderSize, ltfsIndexOverheadBytes]() {
+        runBackup(prefix, maxFolderSize, ltfsIndexOverheadBytes);
     });
 }
 
@@ -844,7 +886,7 @@ void MainWindow::on_pushButtonStop_clicked()
 // Writes one entry to done table per successful file (committed every 100 files).
 // ---------------------------------------------------------------------------
 
-void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
+void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 ltfsIndexOverheadBytes)
 {
     const QString sourceRoot = sourcedir.path();
     qDebug() << "[BACKUP] sourceRoot:" << sourceRoot;
@@ -876,27 +918,31 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
         QMetaObject::invokeMethod(ui->progressBarBackup,
             [this,m]{ ui->progressBarBackup->setMaximum(m); }, Qt::QueuedConnection);
     };
-    auto setFolderProgress = [this, maxFolderSize](qint64 bytes, int folderNum, int foldersTotal, int fileCount) {
+    auto setFolderProgress = [this, maxFolderSize](qint64 activeBytes, HardLimitModel model, int folderNum, int foldersTotal, int fileCount) {
         int maxMB = (int)(maxFolderSize / 1000000LL);
-        int curMB = (int)(bytes        / 1000000LL);
-        double pct = maxFolderSize > 0 ? 100.0 * bytes / maxFolderSize : 0.0;
-        QString fmt = QString("Folder %1 of %2+  —  %3%  (%4 files  %5 / %6)")
+        int curMB = (int)(activeBytes  / 1000000LL);
+        double pct = maxFolderSize > 0 ? 100.0 * activeBytes / maxFolderSize : 0.0;
+        QString modelTag = (model == HardLimitModel::Ltfs) ? "LTFS-limited" : "Tar-limited";
+        QString fmt = QString("Folder %1 of %2+  —  %3%  (%4 files  %5 / %6, %7)")
             .arg(folderNum).arg(foldersTotal)
             .arg(QString::number(pct, 'f', 2))
             .arg(fileCount)
-            .arg(QLocale().formattedDataSize(bytes,         2, QLocale::DataSizeSIFormat))
-            .arg(QLocale().formattedDataSize(maxFolderSize, 2, QLocale::DataSizeSIFormat));
+            .arg(QLocale().formattedDataSize(activeBytes,   2, QLocale::DataSizeSIFormat))
+            .arg(QLocale().formattedDataSize(maxFolderSize, 2, QLocale::DataSizeSIFormat))
+            .arg(modelTag);
         QMetaObject::invokeMethod(ui->progressBarFolder, [this, maxMB, curMB, fmt]{
             ui->progressBarFolder->setMaximum(maxMB);
             ui->progressBarFolder->setValue(curMB);
             ui->progressBarFolder->setFormat(fmt);
         }, Qt::QueuedConnection);
     };
-    auto setTarEst = [this](qint64 ltfs, qint64 tar) {
-        QString s = QString("LTFS: %1  |  Tar: %2  |  Overhead: %3")
-            .arg(QLocale().formattedDataSize(ltfs, 2, QLocale::DataSizeSIFormat))
+    auto setTarEst = [this](qint64 tar, qint64 ltfs, qint64 rawBytes, HardLimitModel activeModel) {
+        QString s = QString("Tar: %1%2  |  LTFS: %3%4  |  Raw: %5")
             .arg(QLocale().formattedDataSize(tar,  2, QLocale::DataSizeSIFormat))
-            .arg(QLocale().formattedDataSize(tar - ltfs, 2, QLocale::DataSizeSIFormat));
+            .arg(activeModel == HardLimitModel::Tar  ? " [LIMIT]" : "")
+            .arg(QLocale().formattedDataSize(ltfs, 2, QLocale::DataSizeSIFormat))
+            .arg(activeModel == HardLimitModel::Ltfs ? " [LIMIT]" : "")
+            .arg(QLocale().formattedDataSize(rawBytes, 2, QLocale::DataSizeSIFormat));
         QMetaObject::invokeMethod(ui->labelTarEstimate,
             [this,s]{ ui->labelTarEstimate->setText(s); }, Qt::QueuedConnection);
     };
@@ -910,6 +956,7 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
             ui->pushButtonScanSubfolder->setEnabled(true);
             ui->pushButtonUseSqlite->setEnabled(true);
             ui->pushButtonUseMariaDb->setEnabled(true);
+            ui->lineEditLtfsOverhead->setEnabled(true);
             if (m_pipelineTimer) {
                 m_pipelineTimer->stop();
                 m_pipelineTimer->deleteLater();
@@ -1400,16 +1447,18 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
         QStringList() << (prefix + "_???"), QDir::Dirs, QDir::Name);
 
     QString currentFolder;
-    qint64  currentActualBytes;
+    qint64  currentRawBytes;
     qint64  currentTarEst;
+    qint64  currentLtfsEst;
     int     foldersCompleted;      // folders fully written before the current one
     int     currentFolderFileCount = 0; // files written into the current folder this session
 
     if (existingFolders.isEmpty()) {
         currentFolder      = destBase + "/" + prefix + "_001";
         QDir().mkpath(currentFolder);
-        currentActualBytes    = 0;
-        currentTarEst         = 1024;
+        currentRawBytes        = 0;
+        currentTarEst          = 1024;
+        currentLtfsEst         = 0;
         foldersCompleted      = 0;
         currentFolderFileCount = 0;
         qDebug() << "[BACKUP] created first folder:" << currentFolder;
@@ -1421,28 +1470,31 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
         // previous run was interrupted before committing all done entries.
         setStatus(QString("Scanning folder fill for %1 (may take a moment on NFS)…")
             .arg(existingFolders.last()));
-        auto [fsActual, fsTar] = folderSizes(currentFolder);
-        currentActualBytes     = fsActual;
-        currentTarEst          = fsTar;
+        FolderSizes fs          = folderSizes(currentFolder, ltfsIndexOverheadBytes);
+        currentRawBytes         = fs.actualBytes;
+        currentTarEst           = fs.tarBytes;
+        currentLtfsEst          = fs.ltfsBytes;
         currentFolderFileCount = 0; // counts files added this session; prior files not re-counted
 
         qDebug() << "[BACKUP] resuming — folders completed:" << foldersCompleted
                  << "current:" << currentFolder
-                 << "LTFS:" << QLocale().formattedDataSize(currentActualBytes)
-                 << "tar:"  << QLocale().formattedDataSize(currentTarEst);
+                 << "tar:"  << QLocale().formattedDataSize(currentTarEst)
+                 << "ltfs:" << QLocale().formattedDataSize(currentLtfsEst);
     }
-    setTarEst(currentActualBytes, currentTarEst);
-    setFolderProgress(currentActualBytes, foldersCompleted + 1, foldersCompleted + 1, currentFolderFileCount);
+    HardLimitModel activeModel = activeHardLimitModel.load();
+    qint64 activeBytes = (activeModel == HardLimitModel::Ltfs) ? currentLtfsEst : currentTarEst;
+    setTarEst(currentTarEst, currentLtfsEst, currentRawBytes, activeModel);
+    setFolderProgress(activeBytes, activeModel, foldersCompleted + 1, foldersCompleted + 1, currentFolderFileCount);
 
     if (existingFolders.isEmpty()) {
         setStatus(QString("Starting fresh — first folder: %1  |  %2 files to process")
             .arg(QDir(currentFolder).dirName())
             .arg(QLocale().toString(totalRemaining)));
     } else {
-        setStatus(QString("Resuming — folder: %1  |  filled: %2 LTFS / %3 tar  |  folders done: %4")
+        setStatus(QString("Resuming — folder: %1  |  filled: %2 tar / %3 LTFS  |  folders done: %4")
             .arg(QDir(currentFolder).dirName())
-            .arg(QLocale().formattedDataSize(currentActualBytes, 2, QLocale::DataSizeSIFormat))
             .arg(QLocale().formattedDataSize(currentTarEst, 2, QLocale::DataSizeSIFormat))
+            .arg(QLocale().formattedDataSize(currentLtfsEst, 2, QLocale::DataSizeSIFormat))
             .arg(foldersCompleted));
     }
     {
@@ -1450,7 +1502,7 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
             .arg(QLocale().toString((qint64)doneTotal))
             .arg(QLocale().toString(totalRemaining))
             .arg(QDir(currentFolder).dirName())
-            .arg(QLocale().formattedDataSize(currentActualBytes, 2, QLocale::DataSizeSIFormat));
+            .arg(QLocale().formattedDataSize(activeBytes, 2, QLocale::DataSizeSIFormat));
         QMetaObject::invokeMethod(this, [this, statsInit] {
             ui->labelStats->setText(statsInit);
         }, Qt::QueuedConnection);
@@ -1587,17 +1639,28 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
                 continue;
             }
 
-            // Folder-full check (writer decides because gz size is now known)
-            qint64 tarBytes = tarFileBytes((qint64)w.gzData.size());
-            if (currentTarEst + tarBytes > maxFolderSize) {
+            // Folder-full check (writer decides because gz size is now known).
+            // Gated on whichever model the user has selected as the hard
+            // limit — both models' running totals are kept accurate
+            // regardless, so this can be flipped mid-run safely.
+            qint64 gzSizeForCheck = (qint64)w.gzData.size();
+            qint64 nextTarBytes   = tarFileBytes(gzSizeForCheck);
+            qint64 nextLtfsBytes  = ltfsFileBytes(gzSizeForCheck, ltfsIndexOverheadBytes);
+            HardLimitModel rotateCheckModel = activeHardLimitModel.load();
+            bool wouldExceed = (rotateCheckModel == HardLimitModel::Ltfs)
+                ? (currentLtfsEst + nextLtfsBytes > maxFolderSize)
+                : (currentTarEst  + nextTarBytes  > maxFolderSize);
+            if (wouldExceed) {
                 ++foldersCompleted;
                 currentFolder = nextFolderPath();
                 QDir().mkpath(currentFolder);
-                currentActualBytes     = 0;
+                currentRawBytes        = 0;
                 currentTarEst          = 1024;
+                currentLtfsEst         = 0;
                 currentFolderFileCount = 0;
-                qDebug() << "[BACKUP] new folder:" << currentFolder;
-                setFolderProgress(0, foldersCompleted+1, foldersCompleted+1, 0);
+                qDebug() << "[BACKUP] new folder:" << currentFolder << "(limit model:"
+                         << (rotateCheckModel == HardLimitModel::Ltfs ? "LTFS" : "Tar") << ")";
+                setFolderProgress(0, rotateCheckModel, foldersCompleted+1, foldersCompleted+1, 0);
             }
 
             // Ensure subdir exists
@@ -1648,8 +1711,9 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
 
             // Update tracking
             qint64 gzSize = (qint64)w.gzData.size();
-            currentActualBytes += gzSize;
-            currentTarEst      += tarFileBytes(gzSize);
+            currentRawBytes += gzSize;
+            currentTarEst   += tarFileBytes(gzSize);
+            currentLtfsEst  += ltfsFileBytes(gzSize, ltfsIndexOverheadBytes);
             ++currentFolderFileCount;
             totalBytesRead     += w.srcSize;
             totalBytesWritten  += gzSize;
@@ -1690,8 +1754,12 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
                 .arg(QString::number(ratio, 'f', 2))
                 .arg(write_ms));
 
-            setTarEst(currentActualBytes, currentTarEst);
-            setFolderProgress(currentActualBytes, foldersCompleted+1, foldersCompleted+1, currentFolderFileCount);
+            {
+                HardLimitModel m = activeHardLimitModel.load();
+                qint64 activeBytesNow = (m == HardLimitModel::Ltfs) ? currentLtfsEst : currentTarEst;
+                setTarEst(currentTarEst, currentLtfsEst, currentRawBytes, m);
+                setFolderProgress(activeBytesNow, m, foldersCompleted+1, foldersCompleted+1, currentFolderFileCount);
+            }
 
             if (filesProcessed % 1000 == 0) {
                 double elapsed     = totalTimer.elapsed() / 1000.0;
@@ -2149,7 +2217,7 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
     }
 
     setProgressVal(filesProcessed);
-    setTarEst(currentActualBytes, currentTarEst);
+    setTarEst(currentTarEst, currentLtfsEst, currentRawBytes, activeHardLimitModel.load());
     reenable();
 }
 
@@ -2234,4 +2302,35 @@ void MainWindow::on_pushButtonUseMariaDb_clicked()
     } else {
         updateBackendButtons();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Capacity hard-limit model selector (Tar vs LTFS). Safe to flip mid-run —
+// both models' running totals are kept up to date continuously regardless
+// of which one is active, so switching just changes which total the
+// rotation check and progress bar consult from that point on.
+// ---------------------------------------------------------------------------
+
+void MainWindow::setHardLimitModel(HardLimitModel m)
+{
+    activeHardLimitModel.store(m);
+    settings.setValue(kHardLimitModelSettingsKey, m == HardLimitModel::Ltfs ? "ltfs" : "tar");
+    updateHardLimitButtons();
+}
+
+void MainWindow::updateHardLimitButtons()
+{
+    bool isLtfs = activeHardLimitModel.load() == HardLimitModel::Ltfs;
+    ui->pushButtonLimitByLtfs->setChecked(isLtfs);
+    ui->pushButtonLimitByTar->setChecked(!isLtfs);
+}
+
+void MainWindow::on_pushButtonLimitByTar_clicked()  { setHardLimitModel(HardLimitModel::Tar); }
+void MainWindow::on_pushButtonLimitByLtfs_clicked() { setHardLimitModel(HardLimitModel::Ltfs); }
+
+void MainWindow::on_lineEditLtfsOverhead_textChanged(const QString &arg1)
+{
+    bool ok;
+    qint64 v = arg1.toLongLong(&ok);
+    if (ok && v >= 0 && v <= 1048576) settings.setValue(kLtfsOverheadSettingsKey, arg1);
 }
