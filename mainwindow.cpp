@@ -349,67 +349,67 @@ void MainWindow::initiateShutdown()
         stopRequested.store(true);
         log("         Stop signal sent.");
 
-        // Steps 2+3: wait for compress pool (drains inside runBackup() automatically
-        // after reader loop breaks) and for writer to finish its queue.
-        //
-        // Only meaningful once Phase 3 (the write pipeline) has actually
-        // started — filesInWriteMap/filesBeingWritten are legitimately 0
-        // during Phase 1 (verify) or Phase 2 (orphan scan), which don't use
-        // the pipeline at all. Report whichever is actually running instead
-        // of always describing this as "waiting for writer".
         int phase = currentBackupPhase.load();
-        int files = filesInWriteMap.load() + filesBeingWritten.load();
-        int writer_timeout_ms = files > 0 ? files * 60000 : 10000;
         log("  [2/4] Waiting for compress pool...", 2);
-        if (phase == kBackupPhasePipeline) {
+
+        if (phase != kBackupPhasePipeline) {
+            // Phase 1/2 never touches the write pipeline (it starts at
+            // Phase 3) and holds nothing that needs a graceful drain:
+            // Phase 1 is read-only, and Phase 2's inserts sit in an
+            // uncommitted SQLite transaction that gets safely rolled back
+            // on next open if never committed — so there is nothing to
+            // lose by exiting now. A single blocking DB/NFS call inside
+            // Phase 1/2 (e.g. countDoneInFolder(), QFileInfo::exists())
+            // cannot be cancelled from here regardless of how long we
+            // wait, so waiting doesn't buy anything either — close/stop
+            // should be near-instant, not spend even 10s hoping a call
+            // that has already run for 30+ seconds finishes on cue.
+            log(QString("  [3/4] %1 holds no pipeline data — closing now...")
+                    .arg(backupPhaseLabel(phase)), 3);
+            if (waitWithTimeout(300)) {
+                log("         Backup thread returned cleanly.", 4);
+            } else {
+                log(QString("         %1 still running a blocking call that can't be "
+                    "cancelled — exiting immediately (nothing to lose).")
+                        .arg(backupPhaseLabel(phase)), 4);
+                qDebug() << "[STOP] closing immediately —" << backupPhaseLabel(phase)
+                         << "not in write pipeline";
+                std::_Exit(0);
+            }
+        } else {
+            int files = filesInWriteMap.load() + filesBeingWritten.load();
+            int writer_timeout_ms = files > 0 ? files * 60000 : 10000;
             log(QString("  [3/4] Waiting for writer (%1 file%2, max %3 min)...")
                     .arg(files).arg(files == 1 ? "" : "s")
                     .arg(writer_timeout_ms / 60000), 3);
-        } else {
-            log(QString("  [3/4] Waiting for %1 to reach a stop point (max %2 s)...")
-                    .arg(backupPhaseLabel(phase))
-                    .arg(writer_timeout_ms / 1000), 3);
-        }
 
-        if (waitWithTimeout(writer_timeout_ms)) {
-            log("         All threads done.", 4);
-        } else if (phase != kBackupPhasePipeline) {
-            // Not in the write pipeline — there is no writer thread for
-            // forceKillWriter to signal, so waiting on it is pure dead time.
-            // Whatever is stuck is a single blocking NFS call inside
-            // Phase 1/2 (QFileInfo::exists/isValidGzip/a DB query) that
-            // cannot be cancelled from here either way — an extra wait
-            // changes nothing, so go straight to the hard exit instead of
-            // wasting another 60s on a mechanism that doesn't apply.
-            log(QString("         WARNING: %1 still stuck after %2 s (likely a blocked NFS "
-                "read/stat that cannot be cancelled) — force-quitting now instead of "
-                "hanging indefinitely.").arg(backupPhaseLabel(phase)).arg(writer_timeout_ms / 1000), 4);
-            qDebug() << "[STOP] backup thread unresponsive in" << backupPhaseLabel(phase) << "— hard exit";
-            std::_Exit(0);
-        } else {
-            log(QString("         Writer timeout after %1 min — forcing stop...")
-                    .arg(writer_timeout_ms / 60000));
-            forceKillWriter.store(true);
-            // Writer checks forceKillWriter every 200 ms in its wait loop
-            if (waitWithTimeout(60000)) {
-                log("         Writer stopped (force-killed).", 4);
+            if (waitWithTimeout(writer_timeout_ms)) {
+                log("         All threads done.", 4);
             } else {
-                // forceKillWriter only stops the writer thread — it does nothing
-                // for a read stuck inside a blocking NFS syscall, which is what
-                // is actually still running at this point. That read cannot be
-                // cancelled from here, and letting this function return to
-                // close() would just re-enter closeEvent() (backupFuture is
-                // still "running" forever), which calls initiateShutdown() again
-                // — an infinite retry loop, not a graceful wait. There is no
-                // safe graceful path left, so terminate the process immediately
-                // instead of looping. Each successful file already committed
-                // its own DB transaction, so the DB is consistent up to the
-                // last file actually written.
-                log("         WARNING: writer thread still stuck (likely a blocked NFS "
-                    "read/stat that cannot be cancelled) — force-quitting now instead of "
-                    "hanging indefinitely.", 4);
-                qDebug() << "[STOP] backup thread unresponsive after force-kill — hard exit";
-                std::_Exit(0);
+                log(QString("         Writer timeout after %1 min — forcing stop...")
+                        .arg(writer_timeout_ms / 60000));
+                forceKillWriter.store(true);
+                // Writer checks forceKillWriter every 200 ms in its wait loop
+                if (waitWithTimeout(60000)) {
+                    log("         Writer stopped (force-killed).", 4);
+                } else {
+                    // forceKillWriter only stops the writer thread — it does nothing
+                    // for a read stuck inside a blocking NFS syscall, which is what
+                    // is actually still running at this point. That read cannot be
+                    // cancelled from here, and letting this function return to
+                    // close() would just re-enter closeEvent() (backupFuture is
+                    // still "running" forever), which calls initiateShutdown() again
+                    // — an infinite retry loop, not a graceful wait. There is no
+                    // safe graceful path left, so terminate the process immediately
+                    // instead of looping. Each successful file already committed
+                    // its own DB transaction, so the DB is consistent up to the
+                    // last file actually written.
+                    log("         WARNING: writer thread still stuck (likely a blocked NFS "
+                        "read/stat that cannot be cancelled) — force-quitting now instead of "
+                        "hanging indefinitely.", 4);
+                    qDebug() << "[STOP] backup thread unresponsive after force-kill — hard exit";
+                    std::_Exit(0);
+                }
             }
         }
 
@@ -833,7 +833,19 @@ void MainWindow::on_pushButtonStop_clicked()
     qDebug() << "[STOP] Stop button clicked";
     stopRequested.store(true);
     ui->pushButtonStop->setEnabled(false);
-    ui->labelBackupStatus->setText("Stopping — files still in pipeline are finishing, DO NOT CLOSE the app…");
+    int phase = currentBackupPhase.load();
+    if (phase == kBackupPhasePipeline) {
+        ui->labelBackupStatus->setText("Stopping — files still in pipeline are finishing, DO NOT CLOSE the app…");
+    } else {
+        // Phase 1/2 has no pipeline to drain — whatever single DB/NFS call
+        // is currently blocking can't be interrupted by this flag, so this
+        // will only take effect once that call returns on its own. Say so
+        // instead of claiming files are "in pipeline" when none exist yet.
+        ui->labelBackupStatus->setText(
+            QString("Stopping — will take effect once the current %1 step finishes "
+                    "(can't be interrupted mid-call). Close the window to exit immediately.")
+                .arg(backupPhaseLabel(phase)));
+    }
 }
 
 // ---------------------------------------------------------------------------
