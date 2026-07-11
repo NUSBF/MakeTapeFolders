@@ -23,6 +23,8 @@
 #include <sys/vfs.h>
 #include <cstdlib>
 #include <climits>
+#include <thread>
+#include <chrono>
 
 #include "db/DbSync.h"
 
@@ -53,6 +55,45 @@ static const char* backupPhaseLabel(int phase)
         default:                     return "no backup phase";
     }
 }
+
+// ---------------------------------------------------------------------------
+// RAII heartbeat — logs "<label> still running… Ns elapsed" every ~2s from a
+// side thread while a single blocking call (one DB query, one directory
+// listing) is in flight on the calling thread. A "took Nms" log printed
+// after the call returns is silent for the entire duration of a SINGLE slow
+// call with no internal loop to hook progress into — this fills that gap.
+// Construct right before the blocking call, let it go out of scope right
+// after; the destructor stops the side thread and joins it.
+// ---------------------------------------------------------------------------
+class QueryHeartbeat {
+public:
+    explicit QueryHeartbeat(QString label) : m_label(std::move(label))
+    {
+        m_timer.start();
+        m_thread = std::thread([this] {
+            while (!m_stop.load()) {
+                for (int i = 0; i < 20 && !m_stop.load(); ++i)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                if (!m_stop.load())
+                    qDebug().noquote() << QString("[BACKUP] %1 — still running… %2 s elapsed")
+                        .arg(m_label).arg(m_timer.elapsed() / 1000.0, 0, 'f', 1);
+            }
+        });
+    }
+    ~QueryHeartbeat()
+    {
+        m_stop.store(true);
+        if (m_thread.joinable()) m_thread.join();
+    }
+    QueryHeartbeat(const QueryHeartbeat&) = delete;
+    QueryHeartbeat& operator=(const QueryHeartbeat&) = delete;
+
+private:
+    QString m_label;
+    QElapsedTimer m_timer;
+    std::thread m_thread;
+    std::atomic<bool> m_stop{false};
+};
 
 // ---------------------------------------------------------------------------
 // Per-file on-tape bytes when written with tar (always >= LTFS, so staying
@@ -394,7 +435,10 @@ void MainWindow::populateSourceRoots()
     QThreadPool::globalInstance()->start([this, lastSrc]() {
         QElapsedTimer rootsTimer; rootsTimer.start();
         QStringList roots;
-        if (m_db) roots = m_db->sourceRoots();
+        if (m_db) {
+            QueryHeartbeat hb("populateSourceRoots: SELECT DISTINCT source_root");
+            roots = m_db->sourceRoots();
+        }
         qint64 rootsMs = rootsTimer.elapsed();
         qDebug() << "[DB LOAD] found" << roots.size() << "source root(s) —"
                  << "SELECT DISTINCT source_root query took" << rootsMs << "ms";
@@ -433,7 +477,11 @@ void MainWindow::on_comboBoxSourceRoot_currentIndexChanged(int index)
     QString rootForStats = root;
     QThreadPool::globalInstance()->start([this, rootForStats]() {
         // Two simple indexed queries — avoids slow LEFT JOIN on large tables
-        SourceStats stats = m_db->statsForSource(rootForStats);
+        SourceStats stats;
+        {
+            QueryHeartbeat hb(QString("statsForSource(%1)").arg(rootForStats));
+            stats = m_db->statsForSource(rootForStats);
+        }
         qint64 totalFiles = stats.totalFiles, totalSize = stats.totalSize,
                doneFiles  = stats.doneFiles,  doneSize  = stats.doneSize;
 
@@ -876,7 +924,11 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
 
     // ── Count indexed files to detect missing DB scan ─────────────────────
     {
-        qint64 totalIndexed = m_db->countIndexedFiles(sourceRoot);
+        qint64 totalIndexed;
+        {
+            QueryHeartbeat hb("countIndexedFiles");
+            totalIndexed = m_db->countIndexedFiles(sourceRoot);
+        }
         if (totalIndexed == 0) {
             setStatus("No files indexed for this source — scan it first.");
             reenable();
@@ -900,7 +952,10 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
         QString folderPattern = currentFolderName + "/%";
         qDebug() << "[BACKUP] Phase 1: counting done rows for" << currentFolderName << "...";
         QElapsedTimer stepTimer; stepTimer.start();
-        doneTotal = (int)m_db->countDoneInFolder(sourceRoot, folderPattern);
+        {
+            QueryHeartbeat hb(QString("Phase 1: countDoneInFolder(%1)").arg(currentFolderName));
+            doneTotal = (int)m_db->countDoneInFolder(sourceRoot, folderPattern);
+        }
         qDebug() << "[BACKUP] Phase 1: countDoneInFolder took" << stepTimer.elapsed() << "ms —"
                  << doneTotal << "rows";
 
@@ -913,7 +968,11 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
         {
             qDebug() << "[BACKUP] Phase 1: loading" << doneTotal << "done rows for verification...";
             stepTimer.restart();
-            const QVector<DoneVerifyItem> rows = m_db->loadDoneForVerification(sourceRoot, folderPattern);
+            QVector<DoneVerifyItem> rows;
+            {
+                QueryHeartbeat hb(QString("Phase 1: loadDoneForVerification(%1)").arg(currentFolderName));
+                rows = m_db->loadDoneForVerification(sourceRoot, folderPattern);
+            }
             qDebug() << "[BACKUP] Phase 1: loadDoneForVerification took" << stepTimer.elapsed() << "ms —"
                      << rows.size() << "rows loaded";
             for (const DoneVerifyItem& row : rows) {
@@ -1038,13 +1097,18 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
         // All dst values already known-good from Phase 1 (fast O(1) membership test)
         qDebug() << "[BACKUP] Phase 2: loading all known dst paths for" << sourceRoot << "...";
         QElapsedTimer phase2Timer; phase2Timer.start();
-        QSet<QString> knownDst = m_db->allDstForSource(sourceRoot);
+        QSet<QString> knownDst;
+        {
+            QueryHeartbeat hb("Phase 2: allDstForSource");
+            knownDst = m_db->allDstForSource(sourceRoot);
+        }
         qDebug() << "[BACKUP] Phase 2: allDstForSource took" << phase2Timer.elapsed() << "ms —"
                  << knownDst.size() << "known dst paths";
 
         phase2Timer.restart();
         QStringList tapeFolders;
         {
+            QueryHeartbeat hb("Phase 2: tape folder listing");
             QDirIterator dit(destBase, QDir::Dirs | QDir::NoSymLinks | QDir::NoDotAndDotDot);
             QRegularExpression tapeRe("^" + QRegularExpression::escape(prefix) + "_\\d+$");
             while (dit.hasNext()) {
@@ -1085,7 +1149,11 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
             {
                 QString pat = folder + "/%";
                 phase2Timer.restart();
-                FolderTotals totals = m_db->sumDoneBytesForFolder(sourceRoot, pat);
+                FolderTotals totals;
+                {
+                    QueryHeartbeat hb(QString("Phase 2: sumDoneBytesForFolder(%1)").arg(folder));
+                    totals = m_db->sumDoneBytesForFolder(sourceRoot, pat);
+                }
                 doneGzSum = totals.gzBytesSum;
                 doneCount = totals.count;
                 qDebug() << "[BACKUP] Phase 2:" << folder << "sumDoneBytesForFolder took"
@@ -1295,8 +1363,14 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
     qint64 totalSourceBytes  = 0;
     {
         QElapsedTimer t; t.start();
-        totalRemaining   = m_db->countRemaining(sourceRoot);
-        totalSourceBytes = m_db->sumRemainingBytes(sourceRoot);
+        {
+            QueryHeartbeat hb("countRemaining");
+            totalRemaining = m_db->countRemaining(sourceRoot);
+        }
+        {
+            QueryHeartbeat hb("sumRemainingBytes");
+            totalSourceBytes = m_db->sumRemainingBytes(sourceRoot);
+        }
 
         qDebug() << "[BACKUP] remaining:" << totalRemaining << "files,"
                  << QLocale().formattedDataSize(totalSourceBytes) << "took" << t.elapsed() << "ms";
