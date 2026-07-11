@@ -112,28 +112,26 @@
    <!-- CAPACITY HARD-LIMIT MODEL SELECTOR                            -->
    <!-- ============================================================ -->
    <widget class="QLabel" name="labelHardLimitModelLbl">
-    <property name="geometry"><rect><x>10</x><y>166</y><width>140</width><height>26</height></rect></property>
+    <property name="geometry"><rect><x>10</x><y>166</y><width>140</width><height>22</height></rect></property>
     <property name="text"><string>Hard limit uses:</string></property>
-    <property name="alignment"><set>Qt::AlignLeft|Qt::AlignVCenter</set></property>
    </widget>
    <widget class="QPushButton" name="pushButtonLimitByTar">
-    <property name="geometry"><rect><x>155</x><y>166</y><width>90</width><height>26</height></rect></property>
+    <property name="geometry"><rect><x>155</x><y>164</y><width>90</width><height>26</height></rect></property>
     <property name="text"><string>Tar</string></property>
     <property name="checkable"><bool>true</bool></property>
    </widget>
-   <widget class="QLabel" name="labelLtfsOverheadLbl">
-    <property name="geometry"><rect><x>255</x><y>166</y><width>260</width><height>26</height></rect></property>
-    <property name="text"><string>LTFS index overhead/file (bytes):</string></property>
-    <property name="alignment"><set>Qt::AlignLeft|Qt::AlignVCenter</set></property>
-   </widget>
-   <widget class="QLineEdit" name="lineEditLtfsOverhead">
-    <property name="geometry"><rect><x>525</x><y>166</y><width>80</width><height>26</height></rect></property>
-    <property name="text"><string>1024</string></property>
-   </widget>
    <widget class="QPushButton" name="pushButtonLimitByLtfs">
-    <property name="geometry"><rect><x>615</x><y>166</y><width>90</width><height>26</height></rect></property>
+    <property name="geometry"><rect><x>248</x><y>164</y><width>90</width><height>26</height></rect></property>
     <property name="text"><string>LTFS</string></property>
     <property name="checkable"><bool>true</bool></property>
+   </widget>
+   <widget class="QLabel" name="labelLtfsOverheadLbl">
+    <property name="geometry"><rect><x>368</x><y>166</y><width>260</width><height>22</height></rect></property>
+    <property name="text"><string>LTFS index overhead/file (bytes):</string></property>
+   </widget>
+   <widget class="QLineEdit" name="lineEditLtfsOverhead">
+    <property name="geometry"><rect><x>638</x><y>164</y><width>80</width><height>26</height></rect></property>
+    <property name="text"><string>1024</string></property>
    </widget>
 
    <!-- ============================================================ -->
