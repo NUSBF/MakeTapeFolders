@@ -2278,6 +2278,10 @@ void MainWindow::updateBackendButtons()
     bool isSqlite = m_db && m_db->kind() == DbBackend::Kind::Sqlite;
     ui->pushButtonUseSqlite->setChecked(isSqlite);
     ui->pushButtonUseMariaDb->setChecked(!isSqlite);
+    // Text prefix as a guaranteed-visible selection indicator, independent
+    // of whether the :checked stylesheet color renders as expected.
+    ui->pushButtonUseSqlite->setText(isSqlite ? "✓ SQLite" : "SQLite");
+    ui->pushButtonUseMariaDb->setText(!isSqlite ? "✓ MariaDB" : "MariaDB");
 }
 
 void MainWindow::on_pushButtonUseSqlite_clicked()
@@ -2327,6 +2331,8 @@ void MainWindow::updateHardLimitButtons()
     bool isLtfs = activeHardLimitModel.load() == HardLimitModel::Ltfs;
     ui->pushButtonLimitByLtfs->setChecked(isLtfs);
     ui->pushButtonLimitByTar->setChecked(!isLtfs);
+    ui->pushButtonLimitByTar->setText(!isLtfs ? "✓ Tar" : "Tar");
+    ui->pushButtonLimitByLtfs->setText(isLtfs ? "✓ LTFS" : "LTFS");
 }
 
 void MainWindow::on_pushButtonLimitByTar_clicked()  { setHardLimitModel(HardLimitModel::Tar); }
