@@ -80,29 +80,14 @@ if(QT_VERSION_MAJOR EQUAL 6)
 endif()
 
 # ---------------------------------------------------------------------------
-# dbmigrate — standalone CLI to run DbBackend::ensureSchema() (schema
-# creation / one-time SQLite src_hash migration) without needing a
-# GUI/display. Not installed; a dev/ops tool only.
-# ---------------------------------------------------------------------------
-add_executable(dbmigrate
-    tools/dbmigrate_main.cpp
-    db/DbTypes.h
-    db/DbBackend.h
-    db/DbBackend.cpp
-)
-target_link_libraries(dbmigrate PRIVATE Qt${QT_VERSION_MAJOR}::Core Qt${QT_VERSION_MAJOR}::Sql)
-
-# ---------------------------------------------------------------------------
 # Deploy the rebuilt QMYSQL/QMARIADB driver plugin (see
 # thirdparty/sqldrivers/README.md for why the SDK's own copy doesn't load)
-# next to each executable so QCoreApplication::addLibraryPath() picks it up.
+# next to the executable so QCoreApplication::addLibraryPath() picks it up.
 # ---------------------------------------------------------------------------
-foreach(_mtf_target MakeTapeFolders dbmigrate)
-    add_custom_command(TARGET ${_mtf_target} POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory
-            "$<TARGET_FILE_DIR:${_mtf_target}>/sqldrivers"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/sqldrivers/libqsqlmysql.so"
-            "$<TARGET_FILE_DIR:${_mtf_target}>/sqldrivers/libqsqlmysql.so"
-    )
-endforeach()
+add_custom_command(TARGET MakeTapeFolders POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+        "$<TARGET_FILE_DIR:MakeTapeFolders>/sqldrivers"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/sqldrivers/libqsqlmysql.so"
+        "$<TARGET_FILE_DIR:MakeTapeFolders>/sqldrivers/libqsqlmysql.so"
+)
