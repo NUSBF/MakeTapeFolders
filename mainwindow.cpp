@@ -888,7 +888,11 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
             qDebug() << "[BACKUP] Phase 1: no existing folders — nothing to validate";
         } else {
         QString folderPattern = currentFolderName + "/%";
+        qDebug() << "[BACKUP] Phase 1: counting done rows for" << currentFolderName << "...";
+        QElapsedTimer stepTimer; stepTimer.start();
         doneTotal = (int)m_db->countDoneInFolder(sourceRoot, folderPattern);
+        qDebug() << "[BACKUP] Phase 1: countDoneInFolder took" << stepTimer.elapsed() << "ms —"
+                 << doneTotal << "rows";
 
         setStatus(QString("Verifying %1 files in current tape folder %2…").arg(doneTotal).arg(currentFolderName));
 
@@ -897,7 +901,11 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
         std::vector<VerifyItem> verifyItems;
         verifyItems.reserve(doneTotal);
         {
+            qDebug() << "[BACKUP] Phase 1: loading" << doneTotal << "done rows for verification...";
+            stepTimer.restart();
             const QVector<DoneVerifyItem> rows = m_db->loadDoneForVerification(sourceRoot, folderPattern);
+            qDebug() << "[BACKUP] Phase 1: loadDoneForVerification took" << stepTimer.elapsed() << "ms —"
+                     << rows.size() << "rows loaded";
             for (const DoneVerifyItem& row : rows) {
                 if (row.src.isEmpty() || row.dst.isEmpty()) continue;
                 verifyItems.push_back({
@@ -915,15 +923,17 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
         QList<QPair<QString,QString>>       toRemove;  // {src, dstFull}
         std::atomic<int>    checked{0};
         std::atomic<qint64> bytesChecked{0};
+        std::atomic<qint64> lastConsoleLogMs{0};
         QElapsedTimer verifyTimer;
         verifyTimer.start();
+        qDebug() << "[BACKUP] Phase 1: starting verification of" << verifyItems.size() << "files...";
 
         QThreadPool verifyPool;
         verifyPool.setMaxThreadCount(32);
 
         for (auto item : verifyItems) {   // capture by value — loop var changes each iteration
             if (stopRequested.load()) break;
-            verifyPool.start([this, item, &checked, &bytesChecked,
+            verifyPool.start([this, item, &checked, &bytesChecked, &lastConsoleLogMs,
                               &removeMutex, &toRemove, &verifyTimer, doneTotal] {
                 // Tasks already queued (not yet started) when stop is
                 // requested skip their blocking file work entirely instead
@@ -939,6 +949,20 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
                     bytesChecked.fetch_add(item.wasAlreadyGz ? item.origSize : item.gzBytes);
                 }
                 int c = ++checked;
+                // Console progress fires every ~2s of wall time, regardless
+                // of file count, so small batches (fewer than the old fixed
+                // "every 5000 files" threshold) still produce visible
+                // output instead of going silent until they finish.
+                qint64 nowMs = verifyTimer.elapsed();
+                qint64 prevLogMs = lastConsoleLogMs.load();
+                bool timeToLog = (nowMs - prevLogMs) >= 2000
+                    && lastConsoleLogMs.compare_exchange_strong(prevLogMs, nowMs);
+                if (timeToLog || c == doneTotal) {
+                    int bad; { QMutexLocker lk(&removeMutex); bad = toRemove.size(); }
+                    qDebug() << "[VERIFY]" << c << "/" << doneTotal
+                             << "| bad:" << bad
+                             << "| elapsed:" << QString::number(nowMs / 1000.0, 'f', 1) << "s";
+                }
                 if (c % 50 == 0 || c == doneTotal) {
                     double el = verifyTimer.elapsed() / 1000.0;
                     int bad; { QMutexLocker lk(&removeMutex); bad = toRemove.size(); }
@@ -955,10 +979,6 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
                                 .arg(QLocale().formattedDataSize(bc, 2, QLocale::DataSizeSIFormat))
                                 .arg(bad).arg(QString::number(el, 'f', 1)));
                     }, Qt::QueuedConnection);
-                    if (c % 5000 == 0)
-                        qDebug() << "[VERIFY]" << c << "/" << doneTotal
-                                 << "| bad:" << bad
-                                 << "| elapsed:" << QString::number(el,'f',1) << "s";
                 }
             });
         }
@@ -1006,8 +1026,13 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
         setStatus("Scanning destination folders…");
 
         // All dst values already known-good from Phase 1 (fast O(1) membership test)
+        qDebug() << "[BACKUP] Phase 2: loading all known dst paths for" << sourceRoot << "...";
+        QElapsedTimer phase2Timer; phase2Timer.start();
         QSet<QString> knownDst = m_db->allDstForSource(sourceRoot);
+        qDebug() << "[BACKUP] Phase 2: allDstForSource took" << phase2Timer.elapsed() << "ms —"
+                 << knownDst.size() << "known dst paths";
 
+        phase2Timer.restart();
         QStringList tapeFolders;
         {
             QDirIterator dit(destBase, QDir::Dirs | QDir::NoSymLinks | QDir::NoDotAndDotDot);
@@ -1019,6 +1044,8 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
             }
             tapeFolders.sort();
         }
+        qDebug() << "[BACKUP] Phase 2: tape folder listing took" << phase2Timer.elapsed() << "ms —"
+                 << tapeFolders.size() << "folder(s) found";
         if (tapeFolders.isEmpty()) {
             qDebug() << "[RECONCILE] no tape folders found — nothing to reconcile";
         } else {
@@ -1047,9 +1074,12 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
             int    doneCount  = 0;
             {
                 QString pat = folder + "/%";
+                phase2Timer.restart();
                 FolderTotals totals = m_db->sumDoneBytesForFolder(sourceRoot, pat);
                 doneGzSum = totals.gzBytesSum;
                 doneCount = totals.count;
+                qDebug() << "[BACKUP] Phase 2:" << folder << "sumDoneBytesForFolder took"
+                         << phase2Timer.elapsed() << "ms —" << doneCount << "done rows";
             }
 
             // ── Steps 2-4: walk disk, accumulate sizes, reconcile orphans ────
@@ -1059,6 +1089,7 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
             int    folderOrphAdded   = 0;
             int    folderOrphInvalid = 0;
             int    folderOrphNoSrc   = 0;
+            qint64 lastConsoleLogMs  = 0; // time-based console progress, see below
 
             {
                 int dc = std::max(doneCount, 1);
@@ -1079,6 +1110,25 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
                 qint64  fileSize = it.fileInfo().size();
                 diskBytes += fileSize;
                 ++diskCount;
+
+                // Console progress every ~2s of wall time, keyed to every
+                // file walked (not just orphans) — most files in a folder
+                // are already known-good and never reach the orphan-count
+                // logging below, so without this the console goes silent
+                // for the entire walk on a folder with few/no orphans.
+                {
+                    qint64 nowMs = orphanTimer.elapsed();
+                    if (nowMs - lastConsoleLogMs >= 2000) {
+                        lastConsoleLogMs = nowMs;
+                        qDebug() << "[RECONCILE]" << folder
+                                 << "walked:" << diskCount
+                                 << "| orphans checked:" << folderOrphChecked
+                                 << "added:" << folderOrphAdded
+                                 << "deleted:" << folderOrphInvalid
+                                 << "| elapsed:" << QString::number(nowMs / 1000.0, 'f', 1) << "s";
+                    }
+                }
+
                 if (diskCount % 50 == 0) {
                     int dc = diskCount; QString fn = folder;
                     QMetaObject::invokeMethod(this, [this, dc, fn] {
@@ -1179,14 +1229,6 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
                     .arg(doneCount)
                     .arg(QString::number(elapsed, 'f', 1))
                     .arg(QFileInfo(absPath).fileName()));
-
-                if (folderOrphChecked % 20 == 0) {
-                    qDebug() << "[RECONCILE]" << folder
-                             << "orphans:" << folderOrphChecked
-                             << "added:" << folderOrphAdded
-                             << "deleted:" << folderOrphInvalid
-                             << "no-src:" << folderOrphNoSrc;
-                }
             }
 
             // ── Per-folder size comparison (the mismatch check) ──────────────
