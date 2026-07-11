@@ -1,0 +1,8 @@
+build/
+.qtcreator/
+.claude/
+CMakeLists.txt.user
+CMakeLists.txt.user.*
+*.log
+*_20*.log
+session.db

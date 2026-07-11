@@ -1,0 +1,2047 @@
+#include "mainwindow.h"
+#include "./ui_mainwindow.h"
+#include <QCloseEvent>
+#include <QFileDialog>
+#include <QDir>
+#include <QDirIterator>
+#include <QFileInfo>
+#include <QDateTime>
+#include <QElapsedTimer>
+#include <QMessageBox>
+#include <QStandardPaths>
+#include <QTableWidgetItem>
+#include <QThreadPool>
+#include <QLocale>
+#include <QtConcurrent/QtConcurrent>
+#include <zlib.h>
+#include <QMutex>
+#include <QThread>
+#include <QWaitCondition>
+#include <QRegularExpression>
+#include <map>
+#include <QSet>
+#include <sys/vfs.h>
+#include <cstdlib>
+#include <climits>
+
+#include "db/DbSync.h"
+
+// ---------------------------------------------------------------------------
+// Active database backend — flip to MariaDb once the SQLite data is
+// confirmed fully migrated (via the "Sync SQLite -> MariaDB" button).
+// ---------------------------------------------------------------------------
+
+static constexpr DbBackend::Kind kActiveBackend = DbBackend::Kind::Sqlite;
+
+// ---------------------------------------------------------------------------
+// Per-file on-tape bytes when written with tar (always >= LTFS, so staying
+// under 12 TB with this number guarantees fit on tape for both tar and LTFS).
+//   tar:  512 header + data rounded up to 512-byte boundary
+//   LTFS: just the file size — always less than tarFileBytes()
+// ---------------------------------------------------------------------------
+
+static qint64 tarFileBytes(qint64 fileSize)
+{
+    return 512 + ((fileSize + 511) / 512) * 512;
+}
+
+// Gzip validation — checks magic header + ISIZE footer.
+// Pass expectedOriginalSize >= 0 to also verify ISIZE matches (for freshly compressed files).
+// Pass -1 to skip ISIZE check (for copied .gz files where uncompressed size is unknown).
+static bool isValidGzip(const QString& path, qint64 expectedOriginalSize = -1)
+{
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly) || f.size() < 18) return false;
+    QByteArray hdr = f.read(2);
+    if ((uchar)hdr[0] != 0x1f || (uchar)hdr[1] != 0x8b) return false;
+    if (expectedOriginalSize < 0) return true;
+    if (!f.seek(f.size() - 4)) return false;
+    QByteArray tail = f.read(4);
+    quint32 isize = (uchar)tail[0] | ((uchar)tail[1]<<8) | ((uchar)tail[2]<<16) | ((uchar)tail[3]<<24);
+    return isize == (quint32)(expectedOriginalSize & 0xFFFFFFFF);
+}
+
+// Scan existing folder and return {actualBytes, tarBytes} for resume.
+// tarBytes = EOA(1024) + per-file tar overhead, aligned to 512 KB LTO block.
+static QPair<qint64,qint64> folderSizes(const QString& folderPath)
+{
+    qint64 actual = 0, tar = 1024;
+    if (!QDir(folderPath).exists()) return {actual, tar};
+    QDirIterator it(folderPath,
+                    QDir::Files | QDir::NoSymLinks | QDir::NoDotAndDotDot,
+                    QDirIterator::Subdirectories);
+    while (it.hasNext()) {
+        it.next();
+        qint64 sz = it.fileInfo().size();
+        actual += sz;
+        tar    += tarFileBytes(sz);
+    }
+    const qint64 block = 524288;
+    tar = ((tar + block - 1) / block) * block;
+    return {actual, tar};
+}
+
+
+// ---------------------------------------------------------------------------
+// Constructor
+// ---------------------------------------------------------------------------
+
+MainWindow::MainWindow(QWidget *parent)
+    : QMainWindow(parent)
+    , ui(new Ui::MainWindow)
+    , settings("MakeTapeFolders", "MakeTapeFolders")
+{
+    qDebug() << "[INIT 1] setupUi…";
+    ui->setupUi(this);
+    if (settings.contains("geometry")) restoreGeometry(settings.value("geometry").toByteArray());
+    qDebug() << "[INIT 2] setupUi done";
+
+    qDebug() << "[INIT 3] opening DB backend:"
+             << (kActiveBackend == DbBackend::Kind::Sqlite ? "Sqlite" : "MariaDb");
+
+    m_db = std::make_unique<DbBackend>(kActiveBackend);
+    QString dbErr;
+    if (!m_db->ensureSchema(&dbErr)) {
+        QMessageBox::critical(this, "DB Error", "Cannot open session database:\n" + dbErr);
+        m_db.reset();
+    }
+    qDebug() << "[INIT 9] schema ready";
+
+    qDebug() << "[INIT 13] restoring QSettings…";
+    {
+        QString src   = settings.value("source").toString();
+        QString dest  = settings.value("destination").toString();
+        QString pfx   = settings.value("folderPrefix", "tape").toString();
+        QString maxSz = settings.value("maxFolderSize", "12").toString();
+        if (!src.isEmpty())  { sourcedir.setPath(src); }
+        if (!dest.isEmpty()) { destinationdir.setPath(dest); ui->labelDest->setText(dest); }
+        ui->lineEditPrefix->setText(pfx);
+        ui->lineEditMaxSize->setText(maxSz);
+    }
+    qDebug() << "[INIT 14] QSettings done";
+
+    connect(ui->lineEditPrefix, &QLineEdit::textChanged, this, [this](const QString& t){
+        settings.setValue("folderPrefix", t);
+    });
+
+    qApp->setStyleSheet(R"(
+QMainWindow, QWidget#centralwidget { background: #1e1e2e; }
+QLabel { color: #a6adc8; }
+QComboBox, QLineEdit {
+    background: #313244; border: 1px solid #45475a; border-radius: 3px;
+    color: #cdd6f4; padding: 2px 6px;
+}
+QPushButton {
+    background: #45475a; border: 1px solid #585b70; border-radius: 3px;
+    color: #cdd6f4; padding: 3px 10px;
+}
+QPushButton:disabled { background: #2a2a3a; border-color: #3a3a4a; color: #585b70; }
+QPushButton#pushButtonStart         { background: #a6e3a1; color: #1e1e2e; font-weight: bold; }
+QPushButton#pushButtonStart:disabled{ background: #2a3a2a; border-color: #3a4a3a; color: #4a6a4a; }
+QPushButton#pushButtonStop          { background: #f38ba8; color: #1e1e2e; font-weight: bold; }
+QPushButton#pushButtonStop:disabled { background: #2a1a1e; border-color: #3a2a2e; color: #6e4855; }
+
+QGroupBox { border: 1px solid #313244; border-radius: 5px; margin-top: 14px;
+            background: #1e1e2e; color: #cdd6f4; }
+QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left;
+                   padding: 0 6px; color: #cdd6f4; font-weight: bold; }
+
+QGroupBox#groupBoxVerify   { border-color: #6c4e8f; }
+QGroupBox#groupBoxVerify::title  { color: #cba6f7; }
+QGroupBox#groupBoxOrphan   { border-color: #8f5a2a; }
+QGroupBox#groupBoxOrphan::title  { color: #fab387; }
+QGroupBox#groupBoxPipeline { border-color: #2a8f35; }
+QGroupBox#groupBoxPipeline::title { color: #a6e3a1; }
+
+QGroupBox#groupBoxRead     { background: #1c2a3f; border-color: #2a5a8f; }
+QGroupBox#groupBoxRead::title    { color: #89b4fa; }
+QGroupBox#groupBoxCompress { background: #2a1c1f; border-color: #8f2a35; }
+QGroupBox#groupBoxCompress::title { color: #f38ba8; }
+QGroupBox#groupBoxQueue    { background: #1f1a2a; border-color: #5f2a8f; }
+QGroupBox#groupBoxQueue::title   { color: #cba6f7; }
+QGroupBox#groupBoxWrite    { background: #1c2a1f; border-color: #2a8f35; }
+QGroupBox#groupBoxWrite::title   { color: #a6e3a1; }
+
+QLabel#labelReadCount, QLabel#labelCompressCount,
+QLabel#labelQueueCount, QLabel#labelWriteCount { font-size: 36pt; font-weight: 800; }
+QLabel#labelReadCount    { color: #89b4fa; }
+QLabel#labelCompressCount { color: #f38ba8; }
+QLabel#labelQueueCount   { color: #cba6f7; }
+QLabel#labelWriteCount   { color: #a6e3a1; }
+QLabel#labelReadDetail, QLabel#labelCompressDetail,
+QLabel#labelQueueDetail, QLabel#labelWriteDetail { color: #a6adc8; font-size: 10pt; }
+
+QLabel#labelBackupStatus { color: #89b4fa; font-size: 10pt; }
+QLabel#labelStats { color: #a6adc8; font-size: 9pt; font-family: monospace; }
+QLabel#labelScanStatus { color: #a6adc8; }
+QLabel#labelStopWarning {
+    color: #f38ba8; font-size: 11pt; font-weight: bold;
+    background: #3a0a0a; border: 1px solid #f38ba8; border-radius: 3px; padding: 4px 8px;
+}
+
+QProgressBar { background: #313244; border-radius: 3px; border: none;
+               text-align: center; color: #cdd6f4; font-size: 9pt; height: 22px; }
+QProgressBar#progressBarVerify::chunk  { background: #9370bc; border-radius: 3px; }
+QProgressBar#progressBarOrphan::chunk  { background: #b8842a; border-radius: 3px; }
+QProgressBar#progressBarBackup::chunk  { background: #40a060; border-radius: 3px; }
+QProgressBar#progressBarFolder::chunk  { background: #2a6abf; border-radius: 3px; }
+QProgressBar#progressBarScan::chunk    { background: #585b70; border-radius: 3px; }
+QGroupBox#groupBoxShutdown            { border-color: #f38ba8; }
+QGroupBox#groupBoxShutdown::title     { color: #f38ba8; }
+QPlainTextEdit#plainTextEditShutdown  {
+    background: #1a0f0f; color: #cdd6f4;
+    font-family: monospace; font-size: 9pt;
+    border: 1px solid #45475a; border-radius: 3px;
+}
+QProgressBar#progressBarShutdown::chunk { background: #f38ba8; border-radius: 3px; }
+)");
+
+    on_lineEditMaxSize_textChanged(ui->lineEditMaxSize->text());
+
+    // Start is disabled in the .ui file — only enabled when DB stats query finishes
+    m_dbLoadTimer.start();
+    m_dbLoadDispTimer = new QTimer(this);
+    connect(m_dbLoadDispTimer, &QTimer::timeout, this, [this] {
+        ui->labelScanStatus->setText(
+            QString("Loading database… %1 s").arg(m_dbLoadTimer.elapsed() / 1000.0, 0, 'f', 1));
+    });
+    m_dbLoadDispTimer->start(250);
+
+    qDebug() << "[INIT 15] calling populateSourceRoots…";
+    populateSourceRoots();
+    qDebug() << "[INIT 16] constructor done — window should appear now";
+}
+
+// ---------------------------------------------------------------------------
+// Destructor
+// ---------------------------------------------------------------------------
+
+MainWindow::~MainWindow()
+{
+    qDebug() << "[STOP] app destructor — closing";
+    stopRequested.store(true);
+    if (m_db) m_db->interrupt();                          // abort any running DB query
+    QThreadPool::globalInstance()->waitForDone(3000);     // let DB bg tasks exit
+    if (scanFuture.isRunning())   scanFuture.waitForFinished();
+    if (backupFuture.isRunning()) backupFuture.waitForFinished();
+    if (syncFuture.isRunning())   syncFuture.waitForFinished();
+    if (m_db) m_db->closeThreadConnection();               // this (GUI) thread's connection
+    m_db.reset();
+    delete ui;
+}
+
+// ---------------------------------------------------------------------------
+// Clean shutdown — Phase 4 panel
+// ---------------------------------------------------------------------------
+
+void MainWindow::closeEvent(QCloseEvent* event)
+{
+    if (m_shuttingDown) { event->ignore(); return; }
+
+    // Kill any in-progress DB query immediately
+    if (m_db) m_db->interrupt();
+
+    if (!backupFuture.isRunning()) {
+        settings.setValue("geometry", saveGeometry());
+        event->accept();
+        return;
+    }
+    event->ignore();
+    initiateShutdown();
+}
+
+void MainWindow::initiateShutdown()
+{
+    if (m_shuttingDown) return;
+    m_shuttingDown = true;
+
+    ui->groupBoxShutdown->setVisible(true);
+    ui->progressBarShutdown->setValue(0);
+    ui->plainTextEditShutdown->clear();
+    ui->pushButtonStart->setEnabled(false);
+    ui->pushButtonStop->setEnabled(false);
+
+    auto log = [this](const QString& msg, int step = -1) {
+        QMetaObject::invokeMethod(this, [this, msg, step] {
+            ui->plainTextEditShutdown->appendPlainText(msg);
+            if (step >= 0) ui->progressBarShutdown->setValue(step);
+        }, Qt::QueuedConnection);
+    };
+
+    // Qt6: QFuture::waitForFinished() has no timeout — poll manually
+    auto waitWithTimeout = [this](int timeout_ms) -> bool {
+        QElapsedTimer t; t.start();
+        while (backupFuture.isRunning() && t.elapsed() < timeout_ms)
+            QThread::msleep(200);
+        return !backupFuture.isRunning();
+    };
+
+    QThreadPool::globalInstance()->start([this, log, waitWithTimeout] {
+        log("Shutdown initiated.", 0);
+
+        // Step 1: signal stop — reader checks stopRequested every iteration;
+        // compress lambdas check it inside the deflate loop (per 4 MB chunk).
+        // All CVs have 200 ms timeouts so they self-wake without explicit wakeAll.
+        log("  [1/4] Signalling all threads to stop...", 1);
+        qDebug() << "[STOP] window closed while backup running — initiating shutdown";
+        stopRequested.store(true);
+        log("         Stop signal sent.");
+
+        // Steps 2+3: wait for compress pool (drains inside runBackup() automatically
+        // after reader loop breaks) and for writer to finish its queue.
+        int files = filesInWriteMap.load() + filesBeingWritten.load();
+        int writer_timeout_ms = files > 0 ? files * 60000 : 10000;
+        log("  [2/4] Waiting for compress pool...", 2);
+        log(QString("  [3/4] Waiting for writer (%1 file%2, max %3 min)...")
+                .arg(files).arg(files == 1 ? "" : "s")
+                .arg(writer_timeout_ms / 60000), 3);
+
+        if (waitWithTimeout(writer_timeout_ms)) {
+            log("         All threads done.", 4);
+        } else {
+            log(QString("         Writer timeout after %1 min — forcing stop...")
+                    .arg(writer_timeout_ms / 60000));
+            forceKillWriter.store(true);
+            // Writer checks forceKillWriter every 200 ms in its wait loop
+            if (waitWithTimeout(60000)) {
+                log("         Writer stopped (force-killed).", 4);
+            } else {
+                // forceKillWriter only stops the writer thread — it does nothing
+                // for a read stuck inside a blocking NFS syscall, which is what
+                // is actually still running at this point. That read cannot be
+                // cancelled from here, and letting this function return to
+                // close() would just re-enter closeEvent() (backupFuture is
+                // still "running" forever), which calls initiateShutdown() again
+                // — an infinite retry loop, not a graceful wait. There is no
+                // safe graceful path left, so terminate the process immediately
+                // instead of looping. Each successful file already committed
+                // its own DB transaction, so the DB is consistent up to the
+                // last file actually written.
+                log("         WARNING: backup thread still stuck (likely a read "
+                    "blocked on NFS, which cannot be cancelled) — force-quitting "
+                    "now instead of hanging indefinitely.", 4);
+                qDebug() << "[STOP] backup thread unresponsive after force-kill — hard exit";
+                std::_Exit(0);
+            }
+        }
+
+        // Step 4: runBackup() has returned — all stack locals (writeMap, compressPool,
+        // writerThread, gzData QByteArrays) are destroyed by RAII → RAM freed.
+        log("  [4/4] RAM released — shutdown complete.", 4);
+        settings.setValue("geometry", saveGeometry());
+
+        QMetaObject::invokeMethod(this, [this] {
+            m_shuttingDown = false;
+            close();
+        }, Qt::QueuedConnection);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Tab 1 — Populate source root dropdown from DB and show per-root stats
+// ---------------------------------------------------------------------------
+
+void MainWindow::populateSourceRoots()
+{
+    QString lastSrc = settings.value("source").toString();
+    QThreadPool::globalInstance()->start([this, lastSrc]() {
+        QElapsedTimer rootsTimer; rootsTimer.start();
+        QStringList roots;
+        if (m_db) roots = m_db->sourceRoots();
+        qint64 rootsMs = rootsTimer.elapsed();
+        qDebug() << "[DB LOAD] found" << roots.size() << "source root(s) —"
+                 << "SELECT DISTINCT source_root query took" << rootsMs << "ms";
+        QMetaObject::invokeMethod(this, [this, roots, lastSrc]() {
+            ui->comboBoxSourceRoot->blockSignals(true);
+            ui->comboBoxSourceRoot->clear();
+            for (const QString& r : roots) ui->comboBoxSourceRoot->addItem(r);
+            int idx = ui->comboBoxSourceRoot->findText(lastSrc);
+            ui->comboBoxSourceRoot->setCurrentIndex(idx >= 0 ? idx : 0);
+            ui->comboBoxSourceRoot->blockSignals(false);
+            on_comboBoxSourceRoot_currentIndexChanged(
+                qMax(0, ui->comboBoxSourceRoot->currentIndex()));
+        }, Qt::QueuedConnection);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Tab 1 — Source root selection → update stats label + SQL filter
+// ---------------------------------------------------------------------------
+
+void MainWindow::on_comboBoxSourceRoot_currentIndexChanged(int index)
+{
+    if (!m_db) return;
+    QString root = (index >= 0) ? ui->comboBoxSourceRoot->itemText(index) : QString();
+
+    if (!root.isEmpty()) {
+        sourcedir.setPath(root);
+        settings.setValue("source", root);
+    }
+
+    ui->labelBackupStats->setText("Loading…");
+    ui->pushButtonStart->setEnabled(false);
+    m_dbLoadTimer.restart();
+    if (m_dbLoadDispTimer) m_dbLoadDispTimer->start(250);
+
+    QString rootForStats = root;
+    QThreadPool::globalInstance()->start([this, rootForStats]() {
+        // Two simple indexed queries — avoids slow LEFT JOIN on large tables
+        SourceStats stats = m_db->statsForSource(rootForStats);
+        qint64 totalFiles = stats.totalFiles, totalSize = stats.totalSize,
+               doneFiles  = stats.doneFiles,  doneSize  = stats.doneSize;
+
+        QString statsText = QString("%1 files — %2   |   Done: %3 files — %4")
+            .arg(QLocale().toString(totalFiles))
+            .arg(QLocale().formattedDataSize(totalSize, 2))
+            .arg(QLocale().toString(doneFiles))
+            .arg(QLocale().formattedDataSize(doneSize, 2));
+
+        qint64 loadMs = m_dbLoadTimer.elapsed();
+        qDebug() << "[DB LOAD] counted" << totalFiles << "indexed /" << doneFiles
+                 << "done for source" << rootForStats << "—"
+                 << "COUNT/SUM stats query took" << loadMs << "ms";
+
+        QMetaObject::invokeMethod(this, [this, statsText, loadMs]{
+            if (m_dbLoadDispTimer) m_dbLoadDispTimer->stop();
+            ui->labelBackupStats->setText(statsText);
+            ui->pushButtonScanSource->setEnabled(true);
+            ui->pushButtonScanSubfolder->setEnabled(true);
+            ui->comboBoxSourceRoot->setEnabled(true);
+            ui->pushButtonDest->setEnabled(true);
+            ui->lineEditPrefix->setEnabled(true);
+            ui->lineEditMaxSize->setEnabled(true);
+            if (!backupFuture.isRunning() && !scanFuture.isRunning())
+                ui->pushButtonStart->setEnabled(true);
+            // pushButtonStop stays disabled — only enabled when backup is running
+            ui->labelScanStatus->setText(
+                QString("Ready  (DB loaded in %1 s)").arg(loadMs / 1000.0, 0, 'f', 2));
+        }, Qt::QueuedConnection);
+    });
+}
+
+
+// ---------------------------------------------------------------------------
+// Tab 1 — Scan source (independent folder picker, background thread)
+// ---------------------------------------------------------------------------
+
+void MainWindow::on_pushButtonScanSource_clicked()
+{
+    if (!m_db) { QMessageBox::critical(this, "Scan", "Database not open."); return; }
+    if (scanFuture.isRunning()) {
+        QMessageBox::information(this, "Scan", "A scan is already in progress.");
+        return;
+    }
+
+    QFileDialog dialog(this);
+    dialog.setOptions(QFileDialog::HideNameFilterDetails | QFileDialog::DontUseNativeDialog);
+    dialog.setFileMode(QFileDialog::Directory);
+    dialog.setLabelText(QFileDialog::FileName, "Source folder to scan");
+    dialog.setDirectory("/home/data");
+    if (!dialog.exec()) return;
+    QStringList sel = dialog.selectedFiles();
+    if (sel.isEmpty()) return;
+
+    QString src = sel[0];
+    sourcedir.setPath(src);
+    settings.setValue("source", src);
+    ui->comboBoxSourceRoot->blockSignals(true);
+    ui->comboBoxSourceRoot->clear();
+    ui->comboBoxSourceRoot->addItem(src);
+    ui->comboBoxSourceRoot->setCurrentIndex(0);
+    ui->comboBoxSourceRoot->blockSignals(false);
+    scanFuture = QtConcurrent::run([this, src]() { runScan(src, src); });
+}
+
+// ---------------------------------------------------------------------------
+// Tab 1 — Refresh subfolder
+// ---------------------------------------------------------------------------
+
+void MainWindow::on_pushButtonScanSubfolder_clicked()
+{
+    if (!m_db) { QMessageBox::critical(this, "Scan", "Database not open."); return; }
+    if (scanFuture.isRunning()) {
+        QMessageBox::information(this, "Scan", "A scan is already in progress.");
+        return;
+    }
+
+    QFileDialog dialog(this);
+    dialog.setOptions(QFileDialog::HideNameFilterDetails | QFileDialog::DontUseNativeDialog);
+    dialog.setFileMode(QFileDialog::Directory);
+    dialog.setLabelText(QFileDialog::FileName, "Subfolder to refresh");
+    dialog.setDirectory(sourcedir.path());
+    if (!dialog.exec()) return;
+    QStringList sel = dialog.selectedFiles();
+    if (sel.isEmpty()) return;
+    QString subfolder = sel[0];
+
+    QString sourceRoot = sourcedir.path();
+    if (sourceRoot.isEmpty()) {
+        QMessageBox::warning(this, "Refresh subfolder",
+            "No source directory set. Use 'Scan source' first.");
+        return;
+    }
+    if (!subfolder.startsWith(sourceRoot + "/") && subfolder != sourceRoot) {
+        QMessageBox::warning(this, "Refresh subfolder",
+            "Selected folder is not under the current source:\n" + subfolder +
+            "\n\nCurrent source: " + sourceRoot);
+        return;
+    }
+
+    qDebug() << "[SCAN] partial refresh — subfolder:" << subfolder << "root:" << sourceRoot;
+    scanFuture = QtConcurrent::run([this, subfolder, sourceRoot]() {
+        runScan(subfolder, sourceRoot);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Tab 1 — Two-phase background scan
+// Phase 1: fast count (no stat) → sets progress bar max
+// Phase 2: full stat + bulk INSERT OR REPLACE in 1000-row batches
+// ---------------------------------------------------------------------------
+
+void MainWindow::runScan(const QString& scanRoot, const QString& sourceRoot)
+{
+    const bool isPartial = (scanRoot != sourceRoot);
+
+    auto setEnabled = [this](bool en) {
+        QMetaObject::invokeMethod(ui->pushButtonScanSource,     [this,en]{ ui->pushButtonScanSource->setEnabled(en); },     Qt::QueuedConnection);
+        QMetaObject::invokeMethod(ui->pushButtonScanSubfolder,  [this,en]{ ui->pushButtonScanSubfolder->setEnabled(en); },  Qt::QueuedConnection);
+        QMetaObject::invokeMethod(ui->pushButtonStart,          [this,en]{ ui->pushButtonStart->setEnabled(en); },          Qt::QueuedConnection);
+        QMetaObject::invokeMethod(ui->pushButtonSyncToMariaDb,  [this,en]{ ui->pushButtonSyncToMariaDb->setEnabled(en); },  Qt::QueuedConnection);
+        QMetaObject::invokeMethod(ui->pushButtonSyncToSqlite,   [this,en]{ ui->pushButtonSyncToSqlite->setEnabled(en); },   Qt::QueuedConnection);
+    };
+    auto setStatus = [this](const QString& s) {
+        QMetaObject::invokeMethod(ui->labelScanStatus, [this,s]{ ui->labelScanStatus->setText(s); }, Qt::QueuedConnection);
+    };
+    auto setProgressVal = [this](int v) {
+        QMetaObject::invokeMethod(ui->progressBarScan, [this,v]{ ui->progressBarScan->setValue(v); }, Qt::QueuedConnection);
+    };
+    auto setProgressMax = [this](int m) {
+        QMetaObject::invokeMethod(ui->progressBarScan, [this,m]{ ui->progressBarScan->setMaximum(m); }, Qt::QueuedConnection);
+    };
+
+    setEnabled(false);
+
+    // ── Phase 1: count only (no stat — fast on any medium) ────────────────
+    setStatus("Phase 1/2 — counting files…");
+    setProgressMax(0); // indeterminate bounce
+
+    qint64 totalCount = 0;
+    {
+        QDirIterator counter(scanRoot,
+                             QDir::Files | QDir::NoSymLinks | QDir::NoDotAndDotDot,
+                             QDirIterator::Subdirectories);
+        while (counter.hasNext()) { counter.next(); ++totalCount; }
+    }
+
+    qDebug() << "[SCAN] phase 1:" << totalCount << "files in" << scanRoot;
+    setProgressMax((int)totalCount);
+    setProgressVal(0);
+    setStatus(QString("Phase 2/2 — indexing %1 files…").arg(totalCount));
+
+    // ── Delete stale entries for the scanned subtree ───────────────────────
+    {
+        if (isPartial) {
+            QString relPrefix = scanRoot.mid(sourceRoot.length());
+            if (relPrefix.startsWith('/')) relPrefix = relPrefix.mid(1);
+            m_db->deleteScanForSubfolder(sourceRoot, relPrefix + "/%");
+        } else {
+            m_db->deleteScanForSource(sourceRoot);
+        }
+    }
+
+    // ── Phase 2: walk + stat + bulk insert ────────────────────────────────
+    QElapsedTimer timer;
+    timer.start();
+
+    m_db->beginTxn();
+
+    qint64 filesIndexed = 0, totalBytes = 0, batchStart = 0;
+
+    QDirIterator it(scanRoot,
+                    QDir::Files | QDir::NoSymLinks | QDir::NoDotAndDotDot,
+                    QDirIterator::Subdirectories);
+
+    while (it.hasNext()) {
+        it.next();
+        QFileInfo fi  = it.fileInfo();
+        qint64    sz  = fi.size();
+        qint64    mt  = fi.lastModified().toSecsSinceEpoch();
+        qint64    now = QDateTime::currentSecsSinceEpoch();
+
+        QString rel = it.filePath().mid(sourceRoot.length());
+        if (rel.startsWith('/')) rel = rel.mid(1);
+
+        FileRow row;
+        row.source_root = sourceRoot;
+        row.src          = rel;
+        row.size          = sz;
+        row.ext           = fi.suffix().toLower();
+        row.folder        = rel.section('/', 0, 0);
+        row.mtime          = mt;
+        row.scanned_at     = now;
+        m_db->insertScannedFile(row);
+
+        ++filesIndexed;
+        totalBytes += sz;
+
+        if (filesIndexed % 1000 == 0) {
+            m_db->flushTxn();
+
+            qint64 elapsedMs = timer.elapsed();
+            double elapsedS  = elapsedMs / 1000.0;
+            double fps  = elapsedS > 0 ? filesIndexed / elapsedS : 0;
+            double mbps = elapsedS > 0 ? (totalBytes / 1e6) / elapsedS : 0;
+            double batchMs = elapsedMs - batchStart;
+            batchStart = elapsedMs;
+
+            qDebug() << "[SCAN]" << filesIndexed << "/" << totalCount
+                     << "| cumul:" << QString::number(fps,'f',0) << "files/s"
+                     << QString::number(mbps,'f',1) << "MB/s"
+                     << "| batch 1000 in" << QString::number(batchMs,'f',0) << "ms"
+                     << "| elapsed" << QString::number(elapsedS,'f',1) << "s";
+
+            setProgressVal((int)filesIndexed);
+            setStatus(QString("Indexing: %1 / %2  —  %3 files/s  —  %4 MB/s")
+                .arg(filesIndexed).arg(totalCount)
+                .arg(QString::number(fps,'f',0))
+                .arg(QString::number(mbps,'f',1)));
+        }
+    }
+
+    m_db->commitTxn();
+
+    double totalS = timer.elapsed() / 1000.0;
+    double fps  = totalS > 0 ? filesIndexed / totalS : 0;
+    double mbps = totalS > 0 ? (totalBytes / 1e6) / totalS : 0;
+
+    qDebug() << "[SCAN DONE] files:" << filesIndexed
+             << "size:"  << QLocale().formattedDataSize(totalBytes)
+             << "time:"  << QString::number(totalS,'f',1) << "s"
+             << "avg:"   << QString::number(fps,'f',0) << "files/s"
+             << "|"      << QString::number(mbps,'f',1) << "MB/s";
+
+    setProgressVal((int)filesIndexed);
+    setStatus(QString("Done: %1 files, %2 — %3 s — avg %4 files/s, %5 MB/s")
+        .arg(filesIndexed)
+        .arg(QLocale().formattedDataSize(totalBytes))
+        .arg(QString::number(totalS,'f',1))
+        .arg(QString::number(fps,'f',0))
+        .arg(QString::number(mbps,'f',1)));
+    setEnabled(true);
+
+    // Refresh source root dropdown (adds new root if this was a new directory)
+    QMetaObject::invokeMethod(this, [this]{
+        populateSourceRoots();
+    }, Qt::QueuedConnection);
+}
+
+// ---------------------------------------------------------------------------
+// Destination directory picker (persists to QSettings)
+// ---------------------------------------------------------------------------
+
+void MainWindow::on_pushButtonDest_clicked()
+{
+    QFileDialog dialog(this);
+    dialog.setOptions(QFileDialog::HideNameFilterDetails | QFileDialog::DontUseNativeDialog);
+    dialog.setFileMode(QFileDialog::Directory);
+    dialog.setLabelText(QFileDialog::FileName, "Destination base directory (tape folders are created here)");
+    dialog.setDirectory(destinationdir.path());
+    if (!dialog.exec()) return;
+    QStringList sel = dialog.selectedFiles();
+    if (sel.isEmpty()) return;
+
+    destinationdir.setPath(sel[0]);
+    ui->labelDest->setText(destinationdir.path());
+    settings.setValue("destination", destinationdir.path());
+}
+
+// ---------------------------------------------------------------------------
+// Tab 2 — Max folder size display + save
+// ---------------------------------------------------------------------------
+
+void MainWindow::on_lineEditMaxSize_textChanged(const QString &arg1)
+{
+    bool ok;
+    double tb = arg1.toDouble(&ok);
+    if (ok && tb > 0 && tb <= 20.0) {
+        qint64 bytes = (qint64)(tb * 1000000000000LL);
+        ui->labelMaxFormatted->setText(QString("= %1 bytes").arg(QLocale().toString(bytes)));
+        settings.setValue("maxFolderSize", arg1);
+    } else {
+        ui->labelMaxFormatted->setText(ok ? "Too large (max 20)" : "Invalid");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tab 2 — Start backup
+// ---------------------------------------------------------------------------
+
+void MainWindow::on_pushButtonStart_clicked()
+{
+    if (sourcedir.path().isEmpty() || !sourcedir.exists()) {
+        QMessageBox::critical(this, "Error", "Select a valid source directory first.");
+        return;
+    }
+    if (destinationdir.path().isEmpty() || !destinationdir.exists()) {
+        QMessageBox::critical(this, "Error", "Select a valid destination directory first.");
+        return;
+    }
+    if (!m_db) {
+        QMessageBox::critical(this, "Error", "Session database not open.");
+        return;
+    }
+    if (scanFuture.isRunning()) {
+        QMessageBox::warning(this, "Error", "A database scan is in progress. Wait for it to finish.");
+        return;
+    }
+    if (backupFuture.isRunning()) {
+        QMessageBox::information(this, "Backup", "Backup is already running.");
+        return;
+    }
+
+    // Capture UI values on the main thread before handing off to the background thread
+    QString prefix = ui->lineEditPrefix->text().trimmed();
+    if (prefix.isEmpty()) prefix = "tape";
+    bool ok;
+    double tb = ui->lineEditMaxSize->text().toDouble(&ok);
+    if (!ok || tb <= 0 || tb > 20.0) {
+        QMessageBox::critical(this, "Error", "Invalid tape size — enter a number between 1 and 20 (TB).");
+        return;
+    }
+    qint64 maxFolderSize = (qint64)(tb * 1000000000000LL);
+
+    stopRequested.store(false);
+    ui->pushButtonStart->setEnabled(false);
+    ui->pushButtonStop->setEnabled(true);
+    ui->comboBoxSourceRoot->setEnabled(false);
+    ui->pushButtonDest->setEnabled(false);
+    ui->pushButtonScanSource->setEnabled(false);
+    ui->pushButtonScanSubfolder->setEnabled(false);
+    ui->pushButtonSyncToMariaDb->setEnabled(false);
+    ui->pushButtonSyncToSqlite->setEnabled(false);
+    ui->labelBackupStatus->setText("Starting…");
+    ui->progressBarBackup->setValue(0);
+    ui->progressBarBackup->setMaximum(100);
+
+    backupFuture = QtConcurrent::run([this, prefix, maxFolderSize]() {
+        runBackup(prefix, maxFolderSize);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Tab 2 — Stop backup
+// ---------------------------------------------------------------------------
+
+void MainWindow::on_pushButtonStop_clicked()
+{
+    qDebug() << "[STOP] Stop button clicked";
+    stopRequested.store(true);
+    ui->pushButtonStop->setEnabled(false);
+    ui->labelBackupStatus->setText("Stopping — files still in pipeline are finishing, DO NOT CLOSE the app…");
+}
+
+// ---------------------------------------------------------------------------
+// Tab 2 — Backup worker (background thread, sequential)
+//
+// For each remaining file (ordered by folder then name for sequential disk reads):
+//   - .gz source → copy as-is (no re-compression)
+//   - everything else → deflateInit2 with windowBits=15+16 (proper gzip)
+// Folder-full check uses exact tar-on-tape byte count (no guessing).
+// Writes one entry to done table per successful file (committed every 100 files).
+// ---------------------------------------------------------------------------
+
+void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
+{
+    const QString sourceRoot = sourcedir.path();
+    qDebug() << "[BACKUP] sourceRoot:" << sourceRoot;
+
+    const QString destBase   = destinationdir.path();
+
+    auto detectNFS = [](const QString& path) -> bool {
+        struct statfs sfs;
+        return (statfs(path.toLocal8Bit().constData(), &sfs) == 0 && sfs.f_type == 0x6969);
+    };
+    const bool srcIsNFS  = detectNFS(sourceRoot);
+    const bool destIsNFS = detectNFS(destBase);
+
+    auto setStatus = [this](const QString& s) {
+        QMetaObject::invokeMethod(ui->labelBackupStatus,
+            [this,s]{ ui->labelBackupStatus->setText(s); }, Qt::QueuedConnection);
+    };
+    auto setProgressVal = [this](int v) {
+        QMetaObject::invokeMethod(ui->progressBarBackup, [this, v] {
+            int m = ui->progressBarBackup->maximum();
+            double pct = (m > 0) ? 100.0 * v / m : 0.0;
+            ui->progressBarBackup->setFormat(
+                QString("%1 / %2 files  (%3%)")
+                    .arg(v).arg(m).arg(QString::number(pct, 'f', 2)));
+            ui->progressBarBackup->setValue(v);
+        }, Qt::QueuedConnection);
+    };
+    auto setProgressMax = [this](int m) {
+        QMetaObject::invokeMethod(ui->progressBarBackup,
+            [this,m]{ ui->progressBarBackup->setMaximum(m); }, Qt::QueuedConnection);
+    };
+    auto setFolderProgress = [this, maxFolderSize](qint64 bytes, int folderNum, int foldersTotal, int fileCount) {
+        int maxMB = (int)(maxFolderSize / 1000000LL);
+        int curMB = (int)(bytes        / 1000000LL);
+        double pct = maxFolderSize > 0 ? 100.0 * bytes / maxFolderSize : 0.0;
+        QString fmt = QString("Folder %1 of %2+  —  %3%  (%4 files  %5 / %6)")
+            .arg(folderNum).arg(foldersTotal)
+            .arg(QString::number(pct, 'f', 2))
+            .arg(fileCount)
+            .arg(QLocale().formattedDataSize(bytes,         2, QLocale::DataSizeSIFormat))
+            .arg(QLocale().formattedDataSize(maxFolderSize, 2, QLocale::DataSizeSIFormat));
+        QMetaObject::invokeMethod(ui->progressBarFolder, [this, maxMB, curMB, fmt]{
+            ui->progressBarFolder->setMaximum(maxMB);
+            ui->progressBarFolder->setValue(curMB);
+            ui->progressBarFolder->setFormat(fmt);
+        }, Qt::QueuedConnection);
+    };
+    auto setTarEst = [this](qint64 ltfs, qint64 tar) {
+        QString s = QString("LTFS: %1  |  Tar: %2  |  Overhead: %3")
+            .arg(QLocale().formattedDataSize(ltfs, 2, QLocale::DataSizeSIFormat))
+            .arg(QLocale().formattedDataSize(tar,  2, QLocale::DataSizeSIFormat))
+            .arg(QLocale().formattedDataSize(tar - ltfs, 2, QLocale::DataSizeSIFormat));
+        QMetaObject::invokeMethod(ui->labelTarEstimate,
+            [this,s]{ ui->labelTarEstimate->setText(s); }, Qt::QueuedConnection);
+    };
+    auto reenable = [this]() {
+        QMetaObject::invokeMethod(this, [this]{
+            ui->pushButtonStart->setEnabled(true);
+            ui->pushButtonStop->setEnabled(false);
+            ui->comboBoxSourceRoot->setEnabled(true);
+            ui->pushButtonDest->setEnabled(true);
+            ui->pushButtonScanSource->setEnabled(true);
+            ui->pushButtonScanSubfolder->setEnabled(true);
+            ui->pushButtonSyncToMariaDb->setEnabled(true);
+            ui->pushButtonSyncToSqlite->setEnabled(true);
+            if (m_pipelineTimer) {
+                m_pipelineTimer->stop();
+                m_pipelineTimer->deleteLater();
+                m_pipelineTimer = nullptr;
+            }
+            ui->labelStopWarning->setVisible(false);
+        }, Qt::QueuedConnection);
+    };
+
+    // ── Count indexed files to detect missing DB scan ─────────────────────
+    {
+        qint64 totalIndexed = m_db->countIndexedFiles(sourceRoot);
+        if (totalIndexed == 0) {
+            setStatus("No files indexed for this source — scan it first.");
+            reenable();
+            return;
+        }
+    }
+
+    qDebug() << "[BACKUP] ── Phase 1: validate done table ──────────────────────────";
+    // Only validate files in the current (last) tape folder — completed tapes are not re-checked.
+    QStringList existingFoldersP1 = QDir(destBase).entryList(
+        QStringList() << (prefix + "_???"), QDir::Dirs, QDir::Name);
+    QString currentFolderName = existingFoldersP1.isEmpty() ? QString() : existingFoldersP1.last();
+    qDebug() << "[BACKUP] Phase 1: current folder for validation:" << currentFolderName;
+
+    int doneTotal = 0;
+    {
+        if (currentFolderName.isEmpty()) {
+            qDebug() << "[BACKUP] Phase 1: no existing folders — nothing to validate";
+        } else {
+        QString folderPattern = currentFolderName + "/%";
+        doneTotal = (int)m_db->countDoneInFolder(sourceRoot, folderPattern);
+
+        setStatus(QString("Verifying %1 files in current tape folder %2…").arg(doneTotal).arg(currentFolderName));
+
+        // Load all rows first (SQLite access must be single-threaded)
+        struct VerifyItem { QString src, dstFull; qint64 origSize, gzBytes; bool wasAlreadyGz; };
+        std::vector<VerifyItem> verifyItems;
+        verifyItems.reserve(doneTotal);
+        {
+            const QVector<DoneVerifyItem> rows = m_db->loadDoneForVerification(sourceRoot, folderPattern);
+            for (const DoneVerifyItem& row : rows) {
+                if (row.src.isEmpty() || row.dst.isEmpty()) continue;
+                verifyItems.push_back({
+                    row.src,
+                    destBase + "/" + row.dst,
+                    row.bytes,
+                    row.gzBytes,
+                    row.src.endsWith(".gz", Qt::CaseInsensitive)
+                });
+            }
+        }
+
+        // Verify in parallel — each check is independent (NFS stat + read 6 bytes)
+        QMutex                              removeMutex;
+        QList<QPair<QString,QString>>       toRemove;  // {src, dstFull}
+        std::atomic<int>    checked{0};
+        std::atomic<qint64> bytesChecked{0};
+        QElapsedTimer verifyTimer;
+        verifyTimer.start();
+
+        QThreadPool verifyPool;
+        verifyPool.setMaxThreadCount(32);
+
+        for (auto item : verifyItems) {   // capture by value — loop var changes each iteration
+            if (stopRequested.load()) break;
+            verifyPool.start([this, item, &checked, &bytesChecked,
+                              &removeMutex, &toRemove, &verifyTimer, doneTotal] {
+                bool ok = QFileInfo::exists(item.dstFull) &&
+                          isValidGzip(item.dstFull, item.wasAlreadyGz ? -1 : item.origSize);
+                if (!ok) {
+                    QMutexLocker lk(&removeMutex);
+                    toRemove << qMakePair(item.src, item.dstFull);
+                } else {
+                    bytesChecked.fetch_add(item.wasAlreadyGz ? item.origSize : item.gzBytes);
+                }
+                int c = ++checked;
+                if (c % 50 == 0 || c == doneTotal) {
+                    double el = verifyTimer.elapsed() / 1000.0;
+                    int bad; { QMutexLocker lk(&removeMutex); bad = toRemove.size(); }
+                    qint64 bc = bytesChecked.load();
+                    QMetaObject::invokeMethod(this, [this, c, doneTotal, bad, el, bc] {
+                        ui->progressBarVerify->setMaximum(doneTotal);
+                        ui->progressBarVerify->setValue(c);
+                        ui->labelVerifyStats->setText(
+                            QString("%1 / %2 checked  ·  %3 bad  ·  %4 s")
+                                .arg(c).arg(doneTotal).arg(bad).arg(QString::number(el,'f',1)));
+                        ui->labelBackupStatus->setText(
+                            QString("Verifying %1 / %2  (%3)  —  %4 bad  —  %5 s")
+                                .arg(c).arg(doneTotal)
+                                .arg(QLocale().formattedDataSize(bc, 2, QLocale::DataSizeSIFormat))
+                                .arg(bad).arg(QString::number(el, 'f', 1)));
+                    }, Qt::QueuedConnection);
+                    if (c % 5000 == 0)
+                        qDebug() << "[VERIFY]" << c << "/" << doneTotal
+                                 << "| bad:" << bad
+                                 << "| elapsed:" << QString::number(el,'f',1) << "s";
+                }
+            });
+        }
+        verifyPool.waitForDone();
+
+        // Remove bad destination files (single-threaded, after pool is done)
+        for (auto& [src, dstFull] : toRemove)
+            QFile::remove(dstFull);
+
+        double totalS = verifyTimer.elapsed() / 1000.0;
+        qDebug() << "[BACKUP] verify done:" << checked << "checked,"
+                 << toRemove.size() << "failed, took"
+                 << QString::number(totalS, 'f', 1) << "s";
+
+        setStatus(QString("Verified %1 files (%2) in %3 s  —  %4 removed and re-queued")
+            .arg(checked.load())
+            .arg(QLocale().formattedDataSize(bytesChecked.load(), 2, QLocale::DataSizeSIFormat))
+            .arg(QString::number(totalS, 'f', 1))
+            .arg(toRemove.size()));
+
+        if (!toRemove.isEmpty()) {
+            QVector<QString> badSrcs;
+            badSrcs.reserve(toRemove.size());
+            for (auto& [src, dst_] : toRemove) badSrcs.push_back(src);
+            m_db->deleteBadDoneEntries(sourceRoot, badSrcs);
+        }
+        } // end else (currentFolderName not empty)
+    }
+
+    if (stopRequested.load()) { setStatus("Stopped."); return; }
+
+    qDebug() << "[BACKUP] ── Phase 2: orphan scan + size check ────────────────────";
+    // ── Phase 2: scan destination folders — size-check + orphan reconcile ────
+    //
+    // For each tape_NNN folder:
+    //   1. Sum gz_bytes from done table for that folder → "what done table expects on disk"
+    //   2. Walk all files on disk: accumulate real disk bytes
+    //   3. Report the delta (mismatch = something to investigate)
+    //   4. For every file NOT in done:
+    //        - valid gzip + source in files table → INSERT into done
+    //        - invalid gzip → delete
+    //        - valid but no source entry → leave, count as no-src
+    {
+        setStatus("Scanning destination folders…");
+
+        // All dst values already known-good from Phase 1 (fast O(1) membership test)
+        QSet<QString> knownDst = m_db->allDstForSource(sourceRoot);
+
+        QStringList tapeFolders;
+        {
+            QDirIterator dit(destBase, QDir::Dirs | QDir::NoSymLinks | QDir::NoDotAndDotDot);
+            QRegularExpression tapeRe("^" + QRegularExpression::escape(prefix) + "_\\d+$");
+            while (dit.hasNext()) {
+                dit.next();
+                if (tapeRe.match(dit.fileName()).hasMatch())
+                    tapeFolders << dit.fileName();
+            }
+            tapeFolders.sort();
+        }
+        if (tapeFolders.isEmpty()) {
+            qDebug() << "[RECONCILE] no tape folders found — nothing to reconcile";
+        } else {
+            // Only reconcile the current (highest-numbered) folder.
+            // Sealed folders are already complete; scanning them every run is wrong.
+            tapeFolders = QStringList{ tapeFolders.last() };
+        }
+        qDebug() << "[RECONCILE] reconciling current folder:" << (tapeFolders.isEmpty() ? "(none)" : tapeFolders.first());
+
+        int    totalOrphansAdded   = 0;
+        int    totalOrphansInvalid = 0;
+        int    totalOrphansNoSrc   = 0;
+        qint64 totalBytesAdded     = 0;
+        QElapsedTimer orphanTimer;
+        orphanTimer.start();
+
+        m_db->beginTxn();
+        int batchCount = 0;
+
+        for (const QString& folder : tapeFolders) {
+            if (stopRequested.load()) break;
+            QString folderPath = destBase + "/" + folder;
+
+            // ── Step 1: what the done table expects for this folder ──────────
+            qint64 doneGzSum  = 0;
+            int    doneCount  = 0;
+            {
+                QString pat = folder + "/%";
+                FolderTotals totals = m_db->sumDoneBytesForFolder(sourceRoot, pat);
+                doneGzSum = totals.gzBytesSum;
+                doneCount = totals.count;
+            }
+
+            // ── Steps 2-4: walk disk, accumulate sizes, reconcile orphans ────
+            qint64 diskBytes         = 0;
+            int    diskCount         = 0;
+            int    folderOrphChecked = 0;
+            int    folderOrphAdded   = 0;
+            int    folderOrphInvalid = 0;
+            int    folderOrphNoSrc   = 0;
+
+            {
+                int dc = std::max(doneCount, 1);
+                QMetaObject::invokeMethod(this, [this, dc] {
+                    ui->progressBarOrphan->setMaximum(dc);
+                    ui->progressBarOrphan->setValue(0);
+                    ui->labelOrphanStats->setText("");
+                }, Qt::QueuedConnection);
+            }
+
+            QDirIterator it(folderPath,
+                            QDir::Files | QDir::NoSymLinks | QDir::NoDotAndDotDot,
+                            QDirIterator::Subdirectories);
+            while (it.hasNext()) {
+                if (stopRequested.load()) break;
+                it.next();
+                QString absPath  = it.filePath();
+                qint64  fileSize = it.fileInfo().size();
+                diskBytes += fileSize;
+                ++diskCount;
+                if (diskCount % 50 == 0) {
+                    int dc = diskCount; QString fn = folder;
+                    QMetaObject::invokeMethod(this, [this, dc, fn] {
+                        ui->progressBarOrphan->setValue(dc);
+                        ui->labelOrphanStats->setText(
+                            QString("%1: %2 files checked").arg(fn).arg(dc));
+                    }, Qt::QueuedConnection);
+                }
+
+                QString dstRel = QDir(destBase).relativeFilePath(absPath);
+
+                if (knownDst.contains(dstRel)) {
+                    // Already in done (verified in Phase 1) — count it, move on
+                    double elapsed = orphanTimer.elapsed() / 1000.0;
+                    setStatus(QString(
+                        "%1  |  disk so far: %2 (%3 files)  done-table: %4 (%5 files)  |  %6 s  |  %7")
+                        .arg(folder)
+                        .arg(QLocale().formattedDataSize(diskBytes, 2, QLocale::DataSizeSIFormat))
+                        .arg(diskCount)
+                        .arg(QLocale().formattedDataSize(doneGzSum, 2, QLocale::DataSizeSIFormat))
+                        .arg(doneCount)
+                        .arg(QString::number(elapsed, 'f', 1))
+                        .arg(QFileInfo(absPath).fileName()));
+                    continue;
+                }
+
+                // ── Orphan file: not recorded in done ────────────────────────
+                QString fileRel = absPath.mid(folderPath.length());
+                if (fileRel.startsWith('/')) fileRel = fileRel.mid(1);
+
+                QString srcCandidate;
+                qint64  srcSize      = -1;
+                bool    wasAlreadyGz = false;
+
+                auto tryLookup = [&](const QString& candidate, bool alreadyGz) -> bool {
+                    qint64 sz = 0;
+                    bool found = m_db->sourceFileSize(sourceRoot, candidate, &sz);
+                    if (found) {
+                        srcSize      = sz;
+                        wasAlreadyGz = alreadyGz;
+                        srcCandidate = candidate;
+                    }
+                    return found;
+                };
+
+                if (fileRel.endsWith(".gz", Qt::CaseInsensitive)) {
+                    QString stripped = fileRel.left(fileRel.length() - 3);
+                    if (!tryLookup(stripped, false))     // non-gz source, we compressed it
+                        tryLookup(fileRel, true);        // source was already .gz
+                } else {
+                    tryLookup(fileRel, false);
+                }
+
+                // Full ISIZE check when we know srcSize; magic-only otherwise
+                bool valid = isValidGzip(absPath,
+                    (wasAlreadyGz || srcCandidate.isEmpty()) ? -1 : srcSize);
+
+                ++folderOrphChecked;
+
+                if (valid && !srcCandidate.isEmpty()) {
+                    double ratio = (srcSize > 0 && !wasAlreadyGz)
+                                   ? (double)srcSize / (double)fileSize : 1.0;
+                    m_db->insertOrphanDone(sourceRoot, srcCandidate, dstRel,
+                        wasAlreadyGz ? fileSize : srcSize, fileSize, ratio);
+                    knownDst.insert(dstRel); // prevent double-counting on rescan
+                    ++folderOrphAdded;
+                    ++totalOrphansAdded;
+                    ++batchCount;
+                    totalBytesAdded += fileSize;
+                    if (batchCount % 200 == 0) {
+                        m_db->flushTxn();
+                    }
+                } else if (!valid) {
+                    QFile::remove(absPath);
+                    diskBytes -= fileSize; // removed — don't count in delta
+                    --diskCount;
+                    ++folderOrphInvalid;
+                    ++totalOrphansInvalid;
+                } else {
+                    // valid gzip but source not in files table — leave it
+                    ++folderOrphNoSrc;
+                    ++totalOrphansNoSrc;
+                }
+
+                double elapsed = orphanTimer.elapsed() / 1000.0;
+                setStatus(QString(
+                    "%1  orphan: %2 added  %3 deleted  %4 no-src  "
+                    "|  disk: %5 (%6 files)  done-table: %7 (%8 files)  |  %9 s  |  %10")
+                    .arg(folder)
+                    .arg(folderOrphAdded).arg(folderOrphInvalid).arg(folderOrphNoSrc)
+                    .arg(QLocale().formattedDataSize(diskBytes, 2, QLocale::DataSizeSIFormat))
+                    .arg(diskCount)
+                    .arg(QLocale().formattedDataSize(doneGzSum, 2, QLocale::DataSizeSIFormat))
+                    .arg(doneCount)
+                    .arg(QString::number(elapsed, 'f', 1))
+                    .arg(QFileInfo(absPath).fileName()));
+
+                if (folderOrphChecked % 20 == 0) {
+                    qDebug() << "[RECONCILE]" << folder
+                             << "orphans:" << folderOrphChecked
+                             << "added:" << folderOrphAdded
+                             << "deleted:" << folderOrphInvalid
+                             << "no-src:" << folderOrphNoSrc;
+                }
+            }
+
+            // ── Per-folder size comparison (the mismatch check) ──────────────
+            qint64 delta = diskBytes - doneGzSum;
+            QString deltaSign = (delta >= 0) ? "+" : "";
+            QString folderSummary = QString(
+                "%1  disk=%2 (%3 files)  done-table=%4 (%5 files)  delta=%6%7  "
+                "orphans: %8 checked  %9 added  %10 deleted  %11 no-src")
+                .arg(folder)
+                .arg(QLocale().formattedDataSize(diskBytes, 2, QLocale::DataSizeSIFormat))
+                .arg(diskCount)
+                .arg(QLocale().formattedDataSize(doneGzSum, 2, QLocale::DataSizeSIFormat))
+                .arg(doneCount)
+                .arg(deltaSign)
+                .arg(QLocale().formattedDataSize(qAbs(delta), 2, QLocale::DataSizeSIFormat))
+                .arg(folderOrphChecked)
+                .arg(folderOrphAdded)
+                .arg(folderOrphInvalid)
+                .arg(folderOrphNoSrc);
+
+            qDebug() << "[RECONCILE]" << folderSummary;
+            {
+                QString fs = folderSummary;
+                QMetaObject::invokeMethod(this, [this, fs] {
+                    ui->labelOrphanStats->setText(fs);
+                }, Qt::QueuedConnection);
+            }
+        }
+
+        m_db->commitTxn();
+
+        doneTotal += totalOrphansAdded;
+        double totalS = orphanTimer.elapsed() / 1000.0;
+        qDebug() << "[RECONCILE] complete:"
+                 << "added=" << totalOrphansAdded
+                 << "(" << QLocale().formattedDataSize(totalBytesAdded) << ")"
+                 << "deleted=" << totalOrphansInvalid
+                 << "no-src=" << totalOrphansNoSrc
+                 << "took" << QString::number(totalS, 'f', 1) << "s";
+
+        setStatus(QString(
+            "Folder reconcile: %1 added to done (%2)  |  %3 deleted (corrupt)  |  %4 no-src  |  %5 s")
+            .arg(totalOrphansAdded)
+            .arg(QLocale().formattedDataSize(totalBytesAdded, 2, QLocale::DataSizeSIFormat))
+            .arg(totalOrphansInvalid)
+            .arg(totalOrphansNoSrc)
+            .arg(QString::number(totalS, 'f', 1)));
+    }
+
+    if (stopRequested.load()) { setStatus("Stopped."); return; }
+
+    // ── Count remaining files + bytes for progress bar ───────────────────
+    qint64 totalRemaining    = 0;
+    qint64 totalSourceBytes  = 0;
+    {
+        QElapsedTimer t; t.start();
+        totalRemaining   = m_db->countRemaining(sourceRoot);
+        totalSourceBytes = m_db->sumRemainingBytes(sourceRoot);
+
+        qDebug() << "[BACKUP] remaining:" << totalRemaining << "files,"
+                 << QLocale().formattedDataSize(totalSourceBytes) << "took" << t.elapsed() << "ms";
+    }
+
+    if (totalRemaining == 0) {
+        setStatus("All files done — nothing to do.");
+        reenable();
+        return;
+    }
+
+    setProgressMax((int)totalRemaining);
+    setProgressVal(0);
+    setStatus(QString("Starting — %1 files remaining").arg(QLocale().toString(totalRemaining)));
+    qDebug() << "[BACKUP] starting —" << totalRemaining << "files remaining for" << sourceRoot;
+    qDebug() << "[BACKUP] sourceRoot exists:" << QDir(sourceRoot).exists();
+    {
+        QStringList sample = QDir(sourceRoot).entryList(QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot);
+        qDebug() << "[BACKUP] sourceRoot top-level entries (first 5):" << sample.mid(0,5);
+    }
+
+    // ── Open streaming cursor ─────────────────────────────────────────────
+    qDebug() << "[BACKUP] opening streaming cursor…";
+    DbBackend::RemainingCursor rem = m_db->openRemainingCursor(sourceRoot);
+    qDebug() << "[BACKUP] cursor prepared, waiting for first row…";
+
+    // ── Find current destination folder (last existing, or create first) ──
+    QStringList existingFolders = QDir(destBase).entryList(
+        QStringList() << (prefix + "_???"), QDir::Dirs, QDir::Name);
+
+    QString currentFolder;
+    qint64  currentActualBytes;
+    qint64  currentTarEst;
+    int     foldersCompleted;      // folders fully written before the current one
+    int     currentFolderFileCount = 0; // files written into the current folder this session
+
+    if (existingFolders.isEmpty()) {
+        currentFolder      = destBase + "/" + prefix + "_001";
+        QDir().mkpath(currentFolder);
+        currentActualBytes    = 0;
+        currentTarEst         = 1024;
+        foldersCompleted      = 0;
+        currentFolderFileCount = 0;
+        qDebug() << "[BACKUP] created first folder:" << currentFolder;
+    } else {
+        foldersCompleted = existingFolders.size() - 1;
+        currentFolder    = destBase + "/" + existingFolders.last();
+
+        // Scan filesystem for actual folder fill — the DB may be incomplete if a
+        // previous run was interrupted before committing all done entries.
+        setStatus(QString("Scanning folder fill for %1 (may take a moment on NFS)…")
+            .arg(existingFolders.last()));
+        auto [fsActual, fsTar] = folderSizes(currentFolder);
+        currentActualBytes     = fsActual;
+        currentTarEst          = fsTar;
+        currentFolderFileCount = 0; // counts files added this session; prior files not re-counted
+
+        qDebug() << "[BACKUP] resuming — folders completed:" << foldersCompleted
+                 << "current:" << currentFolder
+                 << "LTFS:" << QLocale().formattedDataSize(currentActualBytes)
+                 << "tar:"  << QLocale().formattedDataSize(currentTarEst);
+    }
+    setTarEst(currentActualBytes, currentTarEst);
+    setFolderProgress(currentActualBytes, foldersCompleted + 1, foldersCompleted + 1, currentFolderFileCount);
+
+    if (existingFolders.isEmpty()) {
+        setStatus(QString("Starting fresh — first folder: %1  |  %2 files to process")
+            .arg(QDir(currentFolder).dirName())
+            .arg(QLocale().toString(totalRemaining)));
+    } else {
+        setStatus(QString("Resuming — folder: %1  |  filled: %2 LTFS / %3 tar  |  folders done: %4")
+            .arg(QDir(currentFolder).dirName())
+            .arg(QLocale().formattedDataSize(currentActualBytes, 2, QLocale::DataSizeSIFormat))
+            .arg(QLocale().formattedDataSize(currentTarEst, 2, QLocale::DataSizeSIFormat))
+            .arg(foldersCompleted));
+    }
+    {
+        QString statsInit = QString("Previously done: %1 files  |  Remaining: %2  |  Current folder: %3  (%4 filled)")
+            .arg(QLocale().toString((qint64)doneTotal))
+            .arg(QLocale().toString(totalRemaining))
+            .arg(QDir(currentFolder).dirName())
+            .arg(QLocale().formattedDataSize(currentActualBytes, 2, QLocale::DataSizeSIFormat));
+        QMetaObject::invokeMethod(this, [this, statsInit] {
+            ui->labelStats->setText(statsInit);
+        }, Qt::QueuedConnection);
+    }
+
+    // Returns the next numbered folder path (e.g. tape_003 → tape_004)
+    auto nextFolderPath = [&]() -> QString {
+        QString name = QDir(currentFolder).dirName();
+        int sep = name.lastIndexOf('_');
+        int num = (sep >= 0) ? name.mid(sep + 1).toInt() : 0;
+        return destBase + "/" + prefix + "_" + QString("%1").arg(num + 1, 3, 10, QChar('0'));
+    };
+
+    // ── Thread count and RAM budget ───────────────────────────────────────
+    int nThreads = qMax(1, QThread::idealThreadCount() - 1);
+    QThreadPool compressPool;
+    compressPool.setMaxThreadCount(nThreads);
+
+    QThreadPool readPool;
+    readPool.setMaxThreadCount(6);
+
+    qint64 ramLimit = 64LL * 1024 * 1024 * 1024;
+    {
+        QFile mi("/proc/meminfo");
+        if (mi.open(QIODevice::ReadOnly)) {
+            for (QString line; !(line = mi.readLine()).isEmpty(); ) {
+                if (line.startsWith("MemAvailable:")) {
+                    qint64 kb = line.split(QRegularExpression("\\s+")).at(1).toLongLong();
+                    qint64 safe = kb * 1024 - 2LL*1024*1024*1024;
+                    ramLimit = qMin(ramLimit, qMax(512LL*1024*1024, safe));
+                    break;
+                }
+            }
+        }
+    }
+    qDebug() << "[BACKUP] threads:" << nThreads
+             << "ramLimit:" << QLocale().formattedDataSize(ramLimit,2,QLocale::DataSizeSIFormat);
+
+    // ── Shared pipeline data ──────────────────────────────────────────────
+    struct WriteItem {
+        int        seq         = 0;
+        QString    rel;
+        QString    gzName;
+        qint64     srcSize     = 0;
+        bool       alreadyGz   = false;
+        QByteArray gzData;
+        bool       ok          = false;
+        qint64     read_ms     = 0;
+        qint64     compress_ms = 0;
+        bool       alreadyReported = false;  // true if addFailed() was already called for this seq
+        QString    failReason;               // specific reason, used instead of a generic message
+    };
+
+    QMutex                  writeMutex;
+    QWaitCondition          writeCV;
+    QWaitCondition          ramCV;
+    std::map<int,WriteItem> writeMap;
+    int                     nextWriteSeq = 0;
+    std::atomic<qint64>     ramInFlight{0};
+    std::atomic<bool>       readerDone{false};
+    std::atomic<qint64>     statReadMs{0}, statCompressMs{0}, statWriteMs{0};
+    std::atomic<int>        readerStalls{0};
+    std::atomic<int>        writeMapDepthMax{0};
+    std::atomic<int>        filesInCompressPipeline{0};  // queued in pool + actively compressing
+    std::atomic<int>        filesCompressedAtomic{0};   // total files that finished compression
+    std::atomic<int>        filesWriteFailed{0};
+    std::atomic<int>        filesBeingRead{0};
+    std::atomic<int>        filesSkippedStop{0};  // bailed before reading started, due to stopRequested
+
+    struct FailedItem { QString srcPath; qint64 srcSize; bool alreadyGz; QString reason; };
+    QMutex                  failedMutex;
+    std::vector<FailedItem> failedItems;
+    auto addFailed = [&](const QString& rel, qint64 srcSize, bool alreadyGz,
+                         const QString& reason, const QString& destEvidence = {}) {
+        QString srcPath = sourceRoot + "/" + rel;
+        QFileInfo si(srcPath);
+        QString msg = QString("[FAILED] %1\n"
+                              "  src    : %2\n"
+                              "  exists : %3  |  size on disk: %4  |  readable: %5")
+            .arg(reason).arg(srcPath)
+            .arg(si.exists() ? "yes" : "NO")
+            .arg(si.size())
+            .arg(si.isReadable() ? "yes" : "NO");
+        if (!destEvidence.isEmpty()) msg += "\n  dest   : " + destEvidence;
+        qDebug().noquote() << msg;
+        QMutexLocker lk(&failedMutex);
+        failedItems.push_back({srcPath, srcSize, alreadyGz, reason});
+        filesWriteFailed.store((int)failedItems.size());
+    };
+    // filesInWriteMap and filesBeingWritten are MainWindow members (needed by shutdown)
+    filesInWriteMap.store(0);
+    filesBeingWritten.store(0);
+    forceKillWriter.store(false);
+    std::atomic<int>        filesProcessedAtomic{0};
+    std::atomic<qint64>     bytesWrittenAtomic{0};
+    std::atomic<qint64>     bytesReadAtomic{0};
+
+    QElapsedTimer totalTimer;
+    totalTimer.start();
+    qint64 totalBytesRead = 0, totalBytesWritten = 0;
+    int    filesProcessed = 0, filesCopied = 0, filesGzipped = 0;
+
+    // ── Stage 3: Writer thread ────────────────────────────────────────────
+    QThread* writerThread = QThread::create([&]() {
+        while (true) {
+            WriteItem w;
+            {
+                QMutexLocker lk(&writeMutex);
+                while (writeMap.count(nextWriteSeq) == 0 &&
+                       !(readerDone.load() && writeMap.empty()) &&
+                       !forceKillWriter.load()) {
+                    writeCV.wait(&writeMutex, 200);
+                }
+                if ((writeMap.empty() && readerDone.load()) || forceKillWriter.load()) break;
+                auto it = writeMap.find(nextWriteSeq);
+                if (it == writeMap.end()) continue;
+                w = std::move(it->second);
+                writeMap.erase(it);
+            }
+            filesInWriteMap.fetch_add(-1);
+            filesBeingWritten.fetch_add(1);  // entering write stage (no gap in counting)
+
+            if (!w.ok) {
+                filesBeingWritten.fetch_add(-1);
+                if (!w.alreadyReported) {
+                    // Read failures already called addFailed() and never added
+                    // to ramInFlight — only compress failures need this here.
+                    addFailed(w.rel, w.srcSize, w.alreadyGz,
+                              w.failReason.isEmpty() ? "compression failed" : w.failReason);
+                    ramInFlight.fetch_add(-w.srcSize);
+                    { QMutexLocker lk(&writeMutex); ramCV.wakeAll(); }
+                }
+                ++nextWriteSeq;
+                continue;
+            }
+
+            // Folder-full check (writer decides because gz size is now known)
+            qint64 tarBytes = tarFileBytes((qint64)w.gzData.size());
+            if (currentTarEst + tarBytes > maxFolderSize) {
+                ++foldersCompleted;
+                currentFolder = nextFolderPath();
+                QDir().mkpath(currentFolder);
+                currentActualBytes     = 0;
+                currentTarEst          = 1024;
+                currentFolderFileCount = 0;
+                qDebug() << "[BACKUP] new folder:" << currentFolder;
+                setFolderProgress(0, foldersCompleted+1, foldersCompleted+1, 0);
+            }
+
+            // Ensure subdir exists
+            QString relDir = QFileInfo(w.gzName).path();
+            if (!relDir.isEmpty() && relDir != ".")
+                QDir().mkpath(currentFolder + "/" + relDir);
+
+            QString destFile = currentFolder + "/" + w.gzName;
+
+            // Write (filesBeingWritten already incremented above)
+            QElapsedTimer wt; wt.start();
+            bool writeOk = false;
+            {
+                QFile outF(destFile);
+                if (outF.open(QIODevice::WriteOnly)) {
+                    writeOk = (outF.write(w.gzData) == (qint64)w.gzData.size());
+                    outF.close();
+                }
+            }
+            qint64 write_ms = wt.elapsed();
+            if (!writeOk) {
+                filesBeingWritten.fetch_add(-1);
+                QFileInfo di(destFile);
+                QString destEvidence = QString("%1  size on disk: %2  (expected %3)")
+                    .arg(destFile).arg(di.size()).arg(w.gzData.size());
+                QFile::remove(destFile);
+                addFailed(w.rel, w.srcSize, w.alreadyGz, "write failed", destEvidence);
+                ramInFlight.fetch_add(-w.srcSize);
+                { QMutexLocker lk(&writeMutex); ramCV.wakeAll(); }
+                ++nextWriteSeq;
+                continue;
+            }
+
+            // Gzip validation for compressed files
+            if (!w.alreadyGz && !isValidGzip(destFile, w.srcSize)) {
+                filesBeingWritten.fetch_add(-1);
+                QFileInfo di(destFile);
+                QString destEvidence = QString("%1  size: %2  (gz expected src %3)")
+                    .arg(destFile).arg(di.size()).arg(w.srcSize);
+                QFile::remove(destFile);
+                addFailed(w.rel, w.srcSize, w.alreadyGz, "gzip validation failed", destEvidence);
+                ramInFlight.fetch_add(-w.srcSize);
+                { QMutexLocker lk(&writeMutex); ramCV.wakeAll(); }
+                ++nextWriteSeq;
+                continue;
+            }
+            filesBeingWritten.fetch_add(-1);  // success: leaving write stage
+
+            // Update tracking
+            qint64 gzSize = (qint64)w.gzData.size();
+            currentActualBytes += gzSize;
+            currentTarEst      += tarFileBytes(gzSize);
+            ++currentFolderFileCount;
+            totalBytesRead     += w.srcSize;
+            totalBytesWritten  += gzSize;
+            if (w.alreadyGz) ++filesCopied; else ++filesGzipped;
+
+            // INSERT into done (9 params)
+            double ratio = (gzSize > 0 && !w.alreadyGz) ? (double)w.srcSize / gzSize : 1.0;
+            QString dstRelPath = QDir(destBase).relativeFilePath(destFile);
+            DoneRow doneRow;
+            doneRow.source_root = sourceRoot;
+            doneRow.src          = w.rel;
+            doneRow.dst           = dstRelPath;
+            doneRow.bytes         = w.srcSize;
+            doneRow.gz_bytes      = gzSize;
+            doneRow.ratio         = ratio;
+            doneRow.read_ms       = w.read_ms;
+            doneRow.compress_ms   = w.compress_ms;
+            doneRow.write_ms      = write_ms;
+            m_db->insertDone(doneRow);
+            m_db->flushTxn();
+
+            statWriteMs.fetch_add(write_ms);
+            ++filesProcessed;
+            filesProcessedAtomic.store(filesProcessed);
+            bytesWrittenAtomic.store(totalBytesWritten);
+            bytesReadAtomic.store(totalBytesRead);
+
+            // Release RAM budget
+            ramInFlight.fetch_add(-w.srcSize);
+            { QMutexLocker lk(&writeMutex); ramCV.wakeAll(); }
+
+            // Status: what was just written
+            setStatus(QString("Writing [%1/%2]: %3  (%4 → %5 gz, ratio %6x, %7 ms write)")
+                .arg(filesProcessed).arg(totalRemaining)
+                .arg(QFileInfo(w.rel).fileName())
+                .arg(QLocale().formattedDataSize(w.srcSize, 2, QLocale::DataSizeSIFormat))
+                .arg(QLocale().formattedDataSize(gzSize, 2, QLocale::DataSizeSIFormat))
+                .arg(QString::number(ratio, 'f', 2))
+                .arg(write_ms));
+
+            setTarEst(currentActualBytes, currentTarEst);
+            setFolderProgress(currentActualBytes, foldersCompleted+1, foldersCompleted+1, currentFolderFileCount);
+
+            if (filesProcessed % 1000 == 0) {
+                double elapsed     = totalTimer.elapsed() / 1000.0;
+                double avgRead     = statReadMs.load()     / (double)filesProcessed;
+                double avgCompress = statCompressMs.load() / (double)filesProcessed;
+                double avgWrite    = statWriteMs.load()    / (double)filesProcessed;
+                qDebug() << "[BACKUP]" << filesProcessed << "/" << totalRemaining
+                         << "| read_avg="     << QString::number(avgRead/1000,'f',2)     << "s"
+                         << "| compress_avg=" << QString::number(avgCompress/1000,'f',2) << "s"
+                         << "| write_avg="    << QString::number(avgWrite/1000,'f',2)    << "s"
+                         << "| RAM_inflight=" << QLocale().formattedDataSize(ramInFlight.load())
+                         << "| writeMap_depth_max=" << writeMapDepthMax.load()
+                         << "| reader_stalls="      << readerStalls.load()
+                         << "| elapsed=" << QString::number(elapsed,'f',0) << "s";
+            }
+
+            ++nextWriteSeq;
+        }
+
+        // If force-killed, free RAM for any items still in writeMap
+        if (forceKillWriter.load()) {
+            QMutexLocker lk(&writeMutex);
+            for (auto& [seq, item] : writeMap) {
+                ramInFlight.fetch_add(-item.srcSize);
+                filesInWriteMap.fetch_add(-1);
+            }
+            writeMap.clear();
+            ramCV.wakeAll();
+        }
+
+        m_db->commitTxn();
+        m_db->closeThreadConnection();   // this thread (writerThread) is about to exit
+    });
+    qDebug() << "[BACKUP] ── Phase 3: pipeline starting ───────────────────────────";
+    qDebug() << "[BACKUP] remaining:" << totalRemaining
+             << "| source:" << (srcIsNFS ? "NFS" : "local")
+             << "| dest:" << (destIsNFS ? "NFS" : "local")
+             << "| RAM limit:" << QLocale().formattedDataSize(ramLimit, 2, QLocale::DataSizeSIFormat)
+             << "| read threads:" << readPool.maxThreadCount()
+             << "| compress threads:" << compressPool.maxThreadCount();
+
+    // Start QTimer on main thread to poll atomics every 250ms
+    int seq = 0;   // declared here (not at the reader loop) so the pipeline
+                   // timer lambda below can capture it by reference
+    int pipelineLogTick = 0;
+    QMetaObject::invokeMethod(this, [&] {
+        m_pipelineTimer = new QTimer(this);
+        connect(m_pipelineTimer, &QTimer::timeout, this, [&] {
+            int reading     = filesBeingRead.load();
+            int compressing = filesInCompressPipeline.load();   // queued in pool + active threads
+            int queued      = filesInWriteMap.load();           // waiting for writer
+            int activeWrite = filesBeingWritten.load();         // 0 or 1
+            int writing     = queued + activeWrite;             // ALL files in write stage
+
+            // Full-pipeline sanity check, logged every ~2s: every seq submitted
+            // must be in exactly one of {reading, compressing, queued, writing,
+            // succeeded, genuinely-failed, stop-skipped}. If the accounted total
+            // doesn't equal the submitted total, a counter is provably broken —
+            // this makes that visible instead of assumed.
+            if (++pipelineLogTick % 8 == 0) {
+                int submitted   = seq;   // racy plain-int read, diagnostic only
+                int succeeded   = filesProcessedAtomic.load();
+                int failed      = filesWriteFailed.load();
+                int stopSkipped = filesSkippedStop.load();
+                int inPipeline  = reading + compressing + queued + activeWrite;
+                int accounted   = inPipeline + succeeded + failed + stopSkipped;
+                qDebug() << "[PIPELINE]" << "submitted=" << submitted
+                         << "| reading=" << reading << "compressing=" << compressing
+                         << "queued=" << queued << "writing=" << activeWrite
+                         << "| succeeded=" << succeeded << "failed=" << failed
+                         << "stopSkipped=" << stopSkipped
+                         << "| accounted=" << accounted
+                         << (accounted == submitted ? "OK" : "MISMATCH — a counter is wrong, diff=")
+                         << (accounted == submitted ? 0 : submitted - accounted);
+            }
+            // reading + compressing + writing = total files in RAM
+            int fp          = qMax(1, filesProcessedAtomic.load());
+            int fc          = qMax(1, filesCompressedAtomic.load());
+            qint64 avgRd    = statReadMs.load()     / fc;
+            qint64 avgCp    = statCompressMs.load() / fc;
+            qint64 avgWr    = statWriteMs.load()    / fp;
+
+            ui->labelReadCount->setText(QString::number(reading));
+            ui->labelReadDetail->setText(
+                QString("%1 threads active  ·  avg %2 ms  ·  %3")
+                    .arg(readPool.activeThreadCount()).arg(avgRd).arg(srcIsNFS ? "NFS" : "local"));
+
+            ui->labelCompressCount->setText(QString::number(compressing));
+            ui->labelCompressDetail->setText(
+                QString("%1 threads active  ·  avg %2 ms")
+                    .arg(compressPool.activeThreadCount()).arg(avgCp));
+
+            // Write Queue: how many are waiting (sub-info)
+            ui->labelQueueCount->setText(QString::number(queued));
+            ui->labelQueueDetail->setText(
+                QLocale().formattedDataSize(ramInFlight.load(), 2, QLocale::DataSizeSIFormat)
+                + " in RAM");
+
+            // Writing: ALL files in write stage (waiting + active)
+            ui->labelWriteCount->setText(QString::number(writing));
+            ui->labelWriteDetail->setText(
+                QString("%1 active  ·  avg %2 ms  ·  %3")
+                    .arg(activeWrite).arg(avgWr).arg(destIsNFS ? "NFS" : "local"));
+            bool bottleneck = destIsNFS && avgWr > avgCp * 3 && avgWr > 500;
+            ui->labelWriteDetail->setStyleSheet(bottleneck ? "color:#f38ba8;" : "");
+
+            int vv = filesProcessedAtomic.load();
+            int mx = (int)totalRemaining;
+            double pct = mx > 0 ? 100.0 * vv / mx : 0.0;
+            ui->progressBarBackup->setFormat(
+                QString("%1 / %2 files  (%3%)  —  %4 / %5")
+                    .arg(vv).arg(mx)
+                    .arg(QString::number(pct, 'f', 2))
+                    .arg(QLocale().formattedDataSize(bytesWrittenAtomic.load(), 2, QLocale::DataSizeSIFormat))
+                    .arg(QLocale().formattedDataSize(totalSourceBytes, 2, QLocale::DataSizeSIFormat)));
+            ui->progressBarBackup->setMaximum(mx);
+            ui->progressBarBackup->setValue(vv);
+
+            double elapsed = totalTimer.elapsed() / 1000.0;
+            double fps  = (elapsed > 0 && vv > 0) ? vv / elapsed : 0;
+            double mbps = elapsed > 0 ? bytesWrittenAtomic.load() / 1e6 / elapsed : 0;
+            double ratioX = bytesWrittenAtomic.load() > 0
+                ? (double)bytesReadAtomic.load() / bytesWrittenAtomic.load() : 0;
+            ui->labelStats->setText(
+                QString("done: %1  |  %2 f/s  |  %3 MB/s  |  ratio: %4x"
+                        "  |  ETA: %5 min  |  RAM: %6  |  failed: %7  |  folder: %8")
+                    .arg(QLocale().toString((qint64)(doneTotal + vv)))
+                    .arg(QString::number(fps, 'f', 2))
+                    .arg(QString::number(mbps, 'f', 1))
+                    .arg(QString::number(ratioX, 'f', 2))
+                    .arg(fps > 0 ? QString::number((mx - vv) / fps / 60, 'f', 0) : "—")
+                    .arg(QLocale().formattedDataSize(ramInFlight.load(), 2, QLocale::DataSizeSIFormat))
+                    .arg(filesWriteFailed.load())
+                    .arg(QDir(currentFolder).dirName()));
+
+            if (stopRequested.load()) {
+                int inFlight = reading + compressing + writing;
+                ui->labelStopWarning->setText(
+                    QString("⚠  STOPPING — %1 file%2 still in pipeline"
+                            "  (%3 reading  ·  %4 compressing  ·  %5 writing)"
+                            "  — DO NOT CLOSE")
+                        .arg(inFlight).arg(inFlight == 1 ? "" : "s")
+                        .arg(reading).arg(compressing).arg(writing));
+                ui->labelStopWarning->setVisible(true);
+            }
+        });
+        m_pipelineTimer->start(250);
+    }, Qt::BlockingQueuedConnection);
+
+    writerThread->start();
+    qDebug() << "[BACKUP] writer thread started";
+
+    // ── Stage 1: Reader loop ──────────────────────────────────────────────
+    qDebug() << "[BACKUP] reader loop starting";
+    m_db->beginTxn();   // wraps the streaming cursor in a consistent read snapshot
+
+    QString rel;
+    qint64 srcSize = 0;
+    while (rem.next(rel, srcSize)) {
+        if (stopRequested.load()) break;
+
+        const QString srcPath = sourceRoot + "/" + rel;
+        bool alreadyGz = QFileInfo(rel).suffix().toLower() == "gz";
+        QString gzName = rel + (alreadyGz ? "" : ".gz");
+
+        // Block until RAM budget allows loading this file, and until the read
+        // pool has room — otherwise the main loop races through the whole
+        // remaining file list and queues it all at once (filesBeingRead would
+        // show the entire backlog instead of the 2-3 files actually reading).
+        auto readBacklogFull = [&] {
+            return filesBeingRead.load() >= readPool.maxThreadCount();
+        };
+        {
+            QMutexLocker lk(&writeMutex);
+            if (ramInFlight.load() + srcSize > ramLimit || readBacklogFull()) {
+                readerStalls.fetch_add(1);
+                while ((ramInFlight.load() + srcSize > ramLimit || readBacklogFull())
+                       && !stopRequested.load())
+                    ramCV.wait(&writeMutex, 200);
+            }
+        }
+        if (stopRequested.load()) break;
+
+        // Stage 1 — Reading: increment on entry, decrement on exit.
+        // The actual read now runs on readPool (2-3 threads) instead of
+        // inline here, so multiple files can be read concurrently.
+        filesBeingRead.fetch_add(1);
+        int capturedSeq = seq;
+        readPool.start([=, &compressPool, &writeMutex, &writeCV, &writeMap,
+                        &writeMapDepthMax, &statReadMs, &statCompressMs,
+                        &filesInCompressPipeline, &filesCompressedAtomic,
+                        &filesBeingRead, &ramInFlight, &filesSkippedStop]() mutable {
+            // A read failure still has to occupy its seq slot in writeMap —
+            // otherwise the writer thread waits forever for a seq that will
+            // never arrive, while later (successful) files pile up unwritten.
+            auto pushReadFailure = [&] {
+                WriteItem w;
+                w.seq             = capturedSeq;
+                w.rel             = rel;
+                w.gzName          = gzName;
+                w.srcSize         = 0;   // never entered ramInFlight — nothing to release
+                w.alreadyGz       = alreadyGz;
+                w.ok              = false;
+                w.alreadyReported = true;   // addFailed() already called below
+                filesInWriteMap.fetch_add(1);   // enter Write Queue, same as a successful compress
+                QMutexLocker lk(&writeMutex);
+                writeMap[capturedSeq] = std::move(w);
+                writeCV.wakeAll();
+            };
+
+            if (this->stopRequested.load()) {
+                filesSkippedStop.fetch_add(1);
+                qDebug() << "[READ] seq=" << capturedSeq << "skipped — stopRequested"
+                         << "(total skipped:" << filesSkippedStop.load() << ")";
+                filesBeingRead.fetch_add(-1);
+                pushReadFailure();
+                return;
+            }
+
+            qDebug() << "[READ] seq=" << capturedSeq << "starting:" << rel
+                     << "(" << QLocale().formattedDataSize(srcSize, 2, QLocale::DataSizeSIFormat) << ")";
+            QElapsedTimer readTimer; readTimer.start();
+            QFile inF(srcPath);
+            if (!inF.open(QIODevice::ReadOnly)) {
+                filesBeingRead.fetch_add(-1);
+                addFailed(rel, srcSize, alreadyGz, "cannot open source file");
+                pushReadFailure();
+                return;
+            }
+
+            // Read in chunks instead of one blocking readAll() call, so actual
+            // throughput (or a true stall at a specific byte offset) is visible
+            // WHILE the read is happening, not just inferred after it finally
+            // returns. Each QFile::read() below is itself still a blocking NFS
+            // call and can't be interrupted mid-chunk, but a 64 MB granularity
+            // means a genuine stall shows up within seconds instead of minutes.
+            const qint64 chunkSize = 64LL << 20;
+            QByteArray inputData;
+            inputData.reserve((int)qMin(srcSize, (qint64)INT_MAX));
+            QByteArray chunk(chunkSize, Qt::Uninitialized);
+            qint64 totalRead   = 0;
+            qint64 lastLogMs   = 0;
+            qint64 lastLogByte = 0;
+            bool   readError   = false;
+            while (true) {
+                qint64 n = inF.read(chunk.data(), chunkSize);
+                if (n < 0) { readError = true; break; }
+                if (n == 0) break;   // EOF
+                inputData.append(chunk.constData(), (int)n);
+                totalRead += n;
+                qint64 nowMs = readTimer.elapsed();
+                if (nowMs - lastLogMs >= 2000) {
+                    double curMBs = ((totalRead - lastLogByte) / 1e6) / ((nowMs - lastLogMs) / 1000.0);
+                    double avgMBs = nowMs > 0 ? (totalRead / 1e6) / (nowMs / 1000.0) : 0;
+                    qDebug() << "[READ] seq=" << capturedSeq << "progress:"
+                             << QLocale().formattedDataSize(totalRead, 2, QLocale::DataSizeSIFormat)
+                             << "/" << QLocale().formattedDataSize(srcSize, 2, QLocale::DataSizeSIFormat)
+                             << "| current:" << QString::number(curMBs, 'f', 1) << "MB/s"
+                             << "| avg:" << QString::number(avgMBs, 'f', 1) << "MB/s";
+                    lastLogMs   = nowMs;
+                    lastLogByte = totalRead;
+                }
+            }
+            inF.close();
+            qint64 rmx = readTimer.elapsed();
+            if (readError) {
+                filesBeingRead.fetch_add(-1);
+                addFailed(rel, srcSize, alreadyGz,
+                          QString("read error after %1 of %2")
+                              .arg(QLocale().formattedDataSize(totalRead))
+                              .arg(QLocale().formattedDataSize(srcSize)));
+                pushReadFailure();
+                return;
+            }
+            if (inputData.isEmpty()) {
+                filesBeingRead.fetch_add(-1);
+                addFailed(rel, srcSize, alreadyGz, "source file empty");
+                pushReadFailure();
+                return;
+            }
+            double doneAvgMBs = rmx > 0 ? (totalRead / 1e6) / (rmx / 1000.0) : 0;
+            qDebug() << "[READ] seq=" << capturedSeq << "done in" << rmx << "ms"
+                     << "| avg" << QString::number(doneAvgMBs, 'f', 1) << "MB/s";
+
+            // File fully in RAM — leave Read stage, enter Compress stage
+            ramInFlight.fetch_add(srcSize);
+            filesBeingRead.fetch_add(-1);
+            filesInCompressPipeline.fetch_add(1);
+
+            // Submit compression task (captures per-file state by value, shared structures by ref)
+            compressPool.start([=, &compressPool, &writeMutex, &writeCV, &writeMap,
+                                &writeMapDepthMax, &statReadMs, &statCompressMs,
+                                &filesInCompressPipeline, &filesCompressedAtomic]() mutable {
+                WriteItem w;
+                w.seq        = capturedSeq;
+                w.rel        = rel;
+                w.gzName     = gzName;
+                w.srcSize    = srcSize;
+                w.alreadyGz  = alreadyGz;
+                w.read_ms    = rmx;
+                w.ok         = false;
+
+                QElapsedTimer ct; ct.start();
+                if (alreadyGz) {
+                    w.gzData = inputData;
+                    w.ok     = true;
+                } else {
+                    z_stream zs = {};
+                    if (deflateInit2(&zs, Z_BEST_SPEED, Z_DEFLATED,
+                                     15+16, 8, Z_DEFAULT_STRATEGY) == Z_OK) {
+                        QByteArray out;
+                        out.reserve(inputData.size() / 2);
+                        QByteArray outBuf(4 << 20, 0);
+                        bool zerr = false;
+                        zs.next_in  = (Bytef*)inputData.constData();
+                        zs.avail_in = (uInt)inputData.size();
+                        int ret = Z_OK;
+                        do {
+                            if (this->stopRequested.load()) {
+                                zerr = true;
+                                w.failReason = "aborted: stopRequested during deflate";
+                                break;
+                            }
+                            zs.next_out  = (Bytef*)outBuf.data();
+                            zs.avail_out = (uInt)outBuf.size();
+                            ret = deflate(&zs, zs.avail_in == 0 ? Z_FINISH : Z_NO_FLUSH);
+                            if (ret == Z_STREAM_ERROR) {
+                                zerr = true;
+                                w.failReason = "Z_STREAM_ERROR from deflate()";
+                                break;
+                            }
+                            out.append(outBuf.constData(), outBuf.size() - (int)zs.avail_out);
+                        } while (ret != Z_STREAM_END);
+                        deflateEnd(&zs);
+                        if (!zerr) { w.gzData = out; w.ok = true; }
+                    } else {
+                        w.failReason = "deflateInit2 failed";
+                    }
+                }
+                w.compress_ms = ct.elapsed();
+
+                double rspeed = rmx > 0 ? (srcSize / 1e6) / (rmx / 1000.0) : 0;
+                double cspeed = w.compress_ms > 0 ? (srcSize / 1e6) / (w.compress_ms / 1000.0) : 0;
+                double ratio  = (w.gzData.size() > 0 && !alreadyGz)
+                                ? (double)srcSize / w.gzData.size() : 1.0;
+
+                if (w.ok && !alreadyGz) {
+                    setStatus(QString("Compressed [%1/%2]: %3  (%4 → %5, %6x, %7 ms @ %8 MB/s)")
+                        .arg(capturedSeq).arg(totalRemaining)
+                        .arg(QFileInfo(rel).fileName())
+                        .arg(QLocale().formattedDataSize(srcSize, 2, QLocale::DataSizeSIFormat))
+                        .arg(QLocale().formattedDataSize((qint64)w.gzData.size(), 2, QLocale::DataSizeSIFormat))
+                        .arg(QString::number(ratio, 'f', 2))
+                        .arg(w.compress_ms)
+                        .arg(QString::number(cspeed, 'f', 1)));
+                } else if (!w.ok) {
+                    setStatus(QString("Compress FAILED [%1/%2]: %3")
+                        .arg(capturedSeq).arg(totalRemaining)
+                        .arg(QFileInfo(rel).fileName()));
+                }
+
+                statReadMs.fetch_add(rmx);
+                statCompressMs.fetch_add(w.compress_ms);
+                filesCompressedAtomic.fetch_add(1);     // total compressed (for correct avg)
+                filesInCompressPipeline.fetch_add(-1);  // leave Compress stage
+                filesInWriteMap.fetch_add(1);           // enter Write Queue
+                QMutexLocker lk(&writeMutex);
+                writeMap[capturedSeq] = std::move(w);
+                int depth = (int)writeMap.size();
+                if (depth > writeMapDepthMax.load()) writeMapDepthMax.store(depth);
+                writeCV.wakeAll();
+            });
+        });
+
+        ++seq;
+        setStatus(QString("Reading [%1/%2]: %3  (%4)")
+            .arg(seq).arg(totalRemaining).arg(rel)
+            .arg(QLocale().formattedDataSize(srcSize,2,QLocale::DataSizeSIFormat)));
+    }
+
+    qDebug() << "[BACKUP] reader loop done — seq:" << seq
+             << "| draining read pool (" << filesBeingRead.load() << "still reading )…";
+    // Drain all reads first (each read may still be about to submit a compress
+    // task), then drain compression tasks before signalling writer. Poll with
+    // a heartbeat instead of a silent waitForDone() so a long-but-progressing
+    // drain is visibly different from one that's actually stuck.
+    {
+        QElapsedTimer dt; dt.start();
+        while (readPool.activeThreadCount() > 0) {
+            qDebug() << "[BACKUP] draining read pool —" << readPool.activeThreadCount()
+                     << "threads active," << filesBeingRead.load() << "files reading, elapsed"
+                     << QString::number(dt.elapsed() / 1000.0, 'f', 1) << "s";
+            QThread::msleep(2000);
+        }
+        readPool.waitForDone();
+    }
+    qDebug() << "[BACKUP] read pool drained — draining compress pool ("
+             << filesInCompressPipeline.load() << "still compressing )…";
+    {
+        QElapsedTimer dt; dt.start();
+        while (compressPool.activeThreadCount() > 0) {
+            qDebug() << "[BACKUP] draining compress pool —" << compressPool.activeThreadCount()
+                     << "threads active," << filesInCompressPipeline.load()
+                     << "files compressing, elapsed"
+                     << QString::number(dt.elapsed() / 1000.0, 'f', 1) << "s";
+            QThread::msleep(2000);
+        }
+        compressPool.waitForDone();
+    }
+    m_db->commitTxn();   // release the reader's read-snapshot transaction
+    qDebug() << "[BACKUP] compress pool drained — signalling writer";
+
+    readerDone.store(true);
+    {
+        QMutexLocker lk(&writeMutex);
+        writeCV.wakeAll();
+    }
+
+    writerThread->wait();
+    qDebug() << "[BACKUP] writer thread done";
+    delete writerThread;
+
+    QMetaObject::invokeMethod(this, [this] {
+        if (m_pipelineTimer) {
+            m_pipelineTimer->stop();
+            m_pipelineTimer->deleteLater();
+            m_pipelineTimer = nullptr;
+        }
+        ui->labelStopWarning->setVisible(false);
+    }, Qt::BlockingQueuedConnection);
+
+    // ── Final summary ─────────────────────────────────────────────────────
+    double totalS = totalTimer.elapsed() / 1000.0;
+    double ratio  = totalBytesWritten > 0 ? (double)totalBytesRead / totalBytesWritten : 0;
+
+    qDebug() << "[BACKUP DONE] files=" << filesProcessed
+             << "| read="    << QLocale().formattedDataSize(totalBytesRead)
+             << "written="   << QLocale().formattedDataSize(totalBytesWritten)
+             << "| avg read="
+             << QString::number(statReadMs.load()/qMax(1,filesProcessed)/1000.0,'f',2) << "s"
+             << "compress="
+             << QString::number(statCompressMs.load()/qMax(1,filesProcessed)/1000.0,'f',2) << "s"
+             << "write="
+             << QString::number(statWriteMs.load()/qMax(1,filesProcessed)/1000.0,'f',2) << "s"
+             << "| stalls="  << readerStalls.load()
+             << "| elapsed=" << QString::number(totalTimer.elapsed()/1000.0,'f',1) << "s";
+
+    if (!stopRequested.load()) {
+        setStatus(QString("Completed %1 files in %2 s  —  ratio %3x  —  written %4")
+            .arg(filesProcessed)
+            .arg(QString::number(totalS,'f',1))
+            .arg(QString::number(ratio,'f',2))
+            .arg(QLocale().formattedDataSize(totalBytesWritten)));
+    }
+
+    setProgressVal(filesProcessed);
+    setTarEst(currentActualBytes, currentTarEst);
+    reenable();
+}
+
+// ---------------------------------------------------------------------------
+// Sync: SQLite <-> MariaDB (safe-keeping / migration). Opens both backends
+// explicitly regardless of which one is "active" (kActiveBackend above).
+// ---------------------------------------------------------------------------
+
+void MainWindow::on_pushButtonSyncToMariaDb_clicked()
+{
+    runSync(DbBackend::Kind::Sqlite, DbBackend::Kind::MariaDb);
+}
+
+void MainWindow::on_pushButtonSyncToSqlite_clicked()
+{
+    runSync(DbBackend::Kind::MariaDb, DbBackend::Kind::Sqlite);
+}
+
+void MainWindow::runSync(DbBackend::Kind fromKind, DbBackend::Kind toKind)
+{
+    if (scanFuture.isRunning() || backupFuture.isRunning()) {
+        QMessageBox::information(this, "Sync", "Wait for the current scan/backup to finish first.");
+        return;
+    }
+    if (syncFuture.isRunning()) {
+        QMessageBox::information(this, "Sync", "A sync is already in progress.");
+        return;
+    }
+
+    ui->pushButtonSyncToMariaDb->setEnabled(false);
+    ui->pushButtonSyncToSqlite->setEnabled(false);
+    ui->pushButtonStart->setEnabled(false);
+    ui->pushButtonScanSource->setEnabled(false);
+    ui->pushButtonScanSubfolder->setEnabled(false);
+    stopRequested.store(false);
+    ui->labelScanStatus->setText("Sync starting…");
+
+    syncFuture = QtConcurrent::run([this, fromKind, toKind]() {
+        auto from = std::make_unique<DbBackend>(fromKind);
+        auto to   = std::make_unique<DbBackend>(toKind);
+        QString err;
+        if (!from->ensureSchema(&err) || !to->ensureSchema(&err)) {
+            QString e = err;
+            QMetaObject::invokeMethod(this, [this, e] {
+                ui->labelScanStatus->setText("Sync FAILED: " + e);
+            }, Qt::QueuedConnection);
+        } else {
+            DbSync::syncAll(*from, *to, [this](const DbSync::Progress& p) {
+                QMetaObject::invokeMethod(this, [this, p] {
+                    ui->labelScanStatus->setText(
+                        QString("Syncing… %1 files, %2 done-records copied")
+                            .arg(p.filesCopied).arg(p.doneCopied));
+                }, Qt::QueuedConnection);
+            }, stopRequested);
+        }
+        from->closeThreadConnection();
+        to->closeThreadConnection();
+
+        QMetaObject::invokeMethod(this, [this] {
+            ui->pushButtonSyncToMariaDb->setEnabled(true);
+            ui->pushButtonSyncToSqlite->setEnabled(true);
+            ui->pushButtonStart->setEnabled(true);
+            ui->pushButtonScanSource->setEnabled(true);
+            ui->pushButtonScanSubfolder->setEnabled(true);
+            ui->labelScanStatus->setText("Sync complete.");
+            populateSourceRoots();
+        }, Qt::QueuedConnection);
+    });
+}

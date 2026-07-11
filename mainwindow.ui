@@ -1,0 +1,281 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>MainWindow</class>
+ <widget class="QMainWindow" name="MainWindow">
+  <property name="geometry">
+   <rect><x>0</x><y>0</y><width>1908</width><height>952</height></rect>
+  </property>
+  <property name="windowTitle"><string>MakeTapeFolders</string></property>
+  <widget class="QWidget" name="centralwidget">
+
+   <!-- ============================================================ -->
+   <!-- SCAN SECTION                                                  -->
+   <!-- ============================================================ -->
+   <widget class="QPushButton" name="pushButtonScanSource">
+    <property name="geometry"><rect><x>10</x><y>8</y><width>130</width><height>26</height></rect></property>
+    <property name="text"><string>Scan source…</string></property>
+    <property name="enabled"><bool>false</bool></property>
+   </widget>
+   <widget class="QPushButton" name="pushButtonScanSubfolder">
+    <property name="geometry"><rect><x>148</x><y>8</y><width>150</width><height>26</height></rect></property>
+    <property name="text"><string>Refresh subfolder…</string></property>
+    <property name="enabled"><bool>false</bool></property>
+   </widget>
+   <widget class="QPushButton" name="pushButtonSyncToMariaDb">
+    <property name="geometry"><rect><x>306</x><y>8</y><width>150</width><height>26</height></rect></property>
+    <property name="text"><string>Sync SQLite → MariaDB</string></property>
+   </widget>
+   <widget class="QPushButton" name="pushButtonSyncToSqlite">
+    <property name="geometry"><rect><x>464</x><y>8</y><width>150</width><height>26</height></rect></property>
+    <property name="text"><string>Sync MariaDB → SQLite</string></property>
+   </widget>
+   <widget class="QLabel" name="labelScanStatus">
+    <property name="geometry"><rect><x>630</x><y>12</y><width>1266</width><height>18</height></rect></property>
+    <property name="text"><string>Select a source directory and click Scan source.</string></property>
+   </widget>
+   <widget class="QProgressBar" name="progressBarScan">
+    <property name="geometry"><rect><x>10</x><y>40</y><width>1880</width><height>20</height></rect></property>
+    <property name="value"><number>0</number></property>
+    <property name="textVisible"><bool>true</bool></property>
+   </widget>
+
+   <!-- ============================================================ -->
+   <!-- BACKUP CONFIG SECTION                                         -->
+   <!-- ============================================================ -->
+
+   <!-- Source root row -->
+   <widget class="QLabel" name="labelSourceLbl">
+    <property name="geometry"><rect><x>10</x><y>72</y><width>90</width><height>22</height></rect></property>
+    <property name="text"><string>Source root:</string></property>
+   </widget>
+   <widget class="QComboBox" name="comboBoxSourceRoot">
+    <property name="geometry"><rect><x>105</x><y>68</y><width>640</width><height>26</height></rect></property>
+    <property name="enabled"><bool>false</bool></property>
+   </widget>
+   <widget class="QLabel" name="labelBackupStats">
+    <property name="geometry"><rect><x>752</x><y>72</y><width>1148</width><height>18</height></rect></property>
+    <property name="text"><string></string></property>
+   </widget>
+
+   <!-- Destination row -->
+   <widget class="QPushButton" name="pushButtonDest">
+    <property name="geometry"><rect><x>10</x><y>100</y><width>110</width><height>26</height></rect></property>
+    <property name="text"><string>Destination…</string></property>
+    <property name="enabled"><bool>false</bool></property>
+   </widget>
+   <widget class="QLabel" name="labelDest">
+    <property name="geometry"><rect><x>128</x><y>104</y><width>1770</width><height>18</height></rect></property>
+    <property name="text"><string>—</string></property>
+   </widget>
+
+   <!-- Prefix / max size / start / stop row -->
+   <widget class="QLabel" name="labelPrefixLbl">
+    <property name="geometry"><rect><x>10</x><y>136</y><width>50</width><height>22</height></rect></property>
+    <property name="text"><string>Prefix:</string></property>
+   </widget>
+   <widget class="QLineEdit" name="lineEditPrefix">
+    <property name="geometry"><rect><x>65</x><y>134</y><width>70</width><height>24</height></rect></property>
+    <property name="text"><string>tape</string></property>
+    <property name="enabled"><bool>false</bool></property>
+   </widget>
+   <widget class="QLabel" name="labelMaxSizeLbl">
+    <property name="geometry"><rect><x>145</x><y>136</y><width>135</width><height>22</height></rect></property>
+    <property name="text"><string>Max tape size (TB):</string></property>
+   </widget>
+   <widget class="QLineEdit" name="lineEditMaxSize">
+    <property name="geometry"><rect><x>285</x><y>134</y><width>60</width><height>24</height></rect></property>
+    <property name="text"><string>12</string></property>
+    <property name="enabled"><bool>false</bool></property>
+   </widget>
+   <widget class="QLabel" name="labelMaxFormatted">
+    <property name="geometry"><rect><x>352</x><y>136</y><width>170</width><height>22</height></rect></property>
+    <property name="text"><string></string></property>
+   </widget>
+   <widget class="QPushButton" name="pushButtonStart">
+    <property name="geometry"><rect><x>530</x><y>128</y><width>120</width><height>32</height></rect></property>
+    <property name="text"><string>▶  Start</string></property>
+    <property name="enabled"><bool>false</bool></property>
+   </widget>
+   <widget class="QPushButton" name="pushButtonStop">
+    <property name="geometry"><rect><x>658</x><y>128</y><width>120</width><height>32</height></rect></property>
+    <property name="text"><string>■  Stop</string></property>
+    <property name="enabled"><bool>false</bool></property>
+   </widget>
+   <widget class="QLabel" name="labelTarEstimate">
+    <property name="geometry"><rect><x>790</x><y>136</y><width>1110</width><height>22</height></rect></property>
+    <property name="text"><string>—</string></property>
+   </widget>
+
+   <!-- ============================================================ -->
+   <!-- STATUS LINE                                                   -->
+   <!-- ============================================================ -->
+   <widget class="QLabel" name="labelBackupStatus">
+    <property name="geometry"><rect><x>10</x><y>166</y><width>1880</width><height>20</height></rect></property>
+    <property name="text"><string>Ready.</string></property>
+   </widget>
+
+   <!-- ============================================================ -->
+   <!-- PHASE 1 — Verify done table                                  -->
+   <!-- ============================================================ -->
+   <widget class="QGroupBox" name="groupBoxVerify">
+    <property name="geometry"><rect><x>10</x><y>192</y><width>1880</width><height>70</height></rect></property>
+    <property name="title"><string>Phase 1 — Verify done table</string></property>
+    <widget class="QProgressBar" name="progressBarVerify">
+     <property name="geometry"><rect><x>10</x><y>22</y><width>1680</width><height>22</height></rect></property>
+     <property name="value"><number>0</number></property>
+    </widget>
+    <widget class="QLabel" name="labelVerifyStats">
+     <property name="geometry"><rect><x>10</x><y>48</y><width>1860</width><height>16</height></rect></property>
+     <property name="text"><string></string></property>
+    </widget>
+   </widget>
+
+   <!-- ============================================================ -->
+   <!-- PHASE 2 — Orphan scan                                        -->
+   <!-- ============================================================ -->
+   <widget class="QGroupBox" name="groupBoxOrphan">
+    <property name="geometry"><rect><x>10</x><y>270</y><width>1880</width><height>70</height></rect></property>
+    <property name="title"><string>Phase 2 — Orphan scan</string></property>
+    <widget class="QProgressBar" name="progressBarOrphan">
+     <property name="geometry"><rect><x>10</x><y>22</y><width>1680</width><height>22</height></rect></property>
+     <property name="value"><number>0</number></property>
+    </widget>
+    <widget class="QLabel" name="labelOrphanStats">
+     <property name="geometry"><rect><x>10</x><y>48</y><width>1860</width><height>16</height></rect></property>
+     <property name="text"><string></string></property>
+    </widget>
+   </widget>
+
+   <!-- ============================================================ -->
+   <!-- PHASE 3 — Pipeline                                           -->
+   <!-- ============================================================ -->
+   <widget class="QGroupBox" name="groupBoxPipeline">
+    <property name="geometry"><rect><x>10</x><y>348</y><width>1880</width><height>356</height></rect></property>
+    <property name="title"><string>Phase 3 — Pipeline</string></property>
+
+    <!-- Stage: Source Read -->
+    <widget class="QGroupBox" name="groupBoxRead">
+     <property name="geometry"><rect><x>10</x><y>22</y><width>440</width><height>122</height></rect></property>
+     <property name="title"><string>Source Read</string></property>
+     <widget class="QLabel" name="labelReadCount">
+      <property name="geometry"><rect><x>10</x><y>22</y><width>420</width><height>56</height></rect></property>
+      <property name="text"><string>—</string></property>
+      <property name="font"><font><pointsize>36</pointsize><bold>true</bold></font></property>
+      <property name="alignment"><set>Qt::AlignHCenter|Qt::AlignVCenter</set></property>
+     </widget>
+     <widget class="QLabel" name="labelReadDetail">
+      <property name="geometry"><rect><x>10</x><y>82</y><width>420</width><height>22</height></rect></property>
+      <property name="text"><string>—</string></property>
+      <property name="alignment"><set>Qt::AlignHCenter|Qt::AlignVCenter</set></property>
+     </widget>
+    </widget>
+
+    <!-- Stage: Compressing -->
+    <widget class="QGroupBox" name="groupBoxCompress">
+     <property name="geometry"><rect><x>460</x><y>22</y><width>440</width><height>122</height></rect></property>
+     <property name="title"><string>Compressing</string></property>
+     <widget class="QLabel" name="labelCompressCount">
+      <property name="geometry"><rect><x>10</x><y>22</y><width>420</width><height>56</height></rect></property>
+      <property name="text"><string>—</string></property>
+      <property name="font"><font><pointsize>36</pointsize><bold>true</bold></font></property>
+      <property name="alignment"><set>Qt::AlignHCenter|Qt::AlignVCenter</set></property>
+     </widget>
+     <widget class="QLabel" name="labelCompressDetail">
+      <property name="geometry"><rect><x>10</x><y>82</y><width>420</width><height>22</height></rect></property>
+      <property name="text"><string>—</string></property>
+      <property name="alignment"><set>Qt::AlignHCenter|Qt::AlignVCenter</set></property>
+     </widget>
+    </widget>
+
+    <!-- Stage: Write Queue -->
+    <widget class="QGroupBox" name="groupBoxQueue">
+     <property name="geometry"><rect><x>910</x><y>22</y><width>440</width><height>122</height></rect></property>
+     <property name="title"><string>Write Queue</string></property>
+     <widget class="QLabel" name="labelQueueCount">
+      <property name="geometry"><rect><x>10</x><y>22</y><width>420</width><height>56</height></rect></property>
+      <property name="text"><string>—</string></property>
+      <property name="font"><font><pointsize>36</pointsize><bold>true</bold></font></property>
+      <property name="alignment"><set>Qt::AlignHCenter|Qt::AlignVCenter</set></property>
+     </widget>
+     <widget class="QLabel" name="labelQueueDetail">
+      <property name="geometry"><rect><x>10</x><y>82</y><width>420</width><height>22</height></rect></property>
+      <property name="text"><string>—</string></property>
+      <property name="alignment"><set>Qt::AlignHCenter|Qt::AlignVCenter</set></property>
+     </widget>
+    </widget>
+
+    <!-- Stage: Writing -->
+    <widget class="QGroupBox" name="groupBoxWrite">
+     <property name="geometry"><rect><x>1360</x><y>22</y><width>510</width><height>122</height></rect></property>
+     <property name="title"><string>Writing</string></property>
+     <widget class="QLabel" name="labelWriteCount">
+      <property name="geometry"><rect><x>10</x><y>22</y><width>490</width><height>56</height></rect></property>
+      <property name="text"><string>—</string></property>
+      <property name="font"><font><pointsize>36</pointsize><bold>true</bold></font></property>
+      <property name="alignment"><set>Qt::AlignHCenter|Qt::AlignVCenter</set></property>
+     </widget>
+     <widget class="QLabel" name="labelWriteDetail">
+      <property name="geometry"><rect><x>10</x><y>82</y><width>490</width><height>22</height></rect></property>
+      <property name="text"><string>—</string></property>
+      <property name="alignment"><set>Qt::AlignHCenter|Qt::AlignVCenter</set></property>
+     </widget>
+    </widget>
+
+    <!-- Overall file progress bar -->
+    <widget class="QProgressBar" name="progressBarBackup">
+     <property name="geometry"><rect><x>10</x><y>154</y><width>1860</width><height>26</height></rect></property>
+     <property name="value"><number>0</number></property>
+    </widget>
+
+    <!-- Current tape folder fill progress bar -->
+    <widget class="QProgressBar" name="progressBarFolder">
+     <property name="geometry"><rect><x>10</x><y>188</y><width>1860</width><height>26</height></rect></property>
+     <property name="value"><number>0</number></property>
+    </widget>
+
+    <!-- Stats line -->
+    <widget class="QLabel" name="labelStats">
+     <property name="geometry"><rect><x>10</x><y>222</y><width>1860</width><height>20</height></rect></property>
+     <property name="text"><string></string></property>
+    </widget>
+
+    <!-- Stop warning (hidden until stop requested) -->
+    <widget class="QLabel" name="labelStopWarning">
+     <property name="geometry"><rect><x>10</x><y>250</y><width>1860</width><height>36</height></rect></property>
+     <property name="text"><string></string></property>
+     <property name="alignment"><set>Qt::AlignHCenter|Qt::AlignVCenter</set></property>
+     <property name="visible"><bool>false</bool></property>
+    </widget>
+
+   </widget>
+   <!-- end groupBoxPipeline -->
+
+   <!-- ============================================================ -->
+   <!-- PHASE 4 — Shutdown (hidden until close pressed during backup) -->
+   <!-- ============================================================ -->
+   <widget class="QGroupBox" name="groupBoxShutdown">
+    <property name="geometry"><rect><x>10</x><y>712</y><width>1880</width><height>218</height></rect></property>
+    <property name="title"><string>Phase 4 — Shutdown</string></property>
+    <property name="visible"><bool>false</bool></property>
+    <widget class="QProgressBar" name="progressBarShutdown">
+     <property name="geometry"><rect><x>10</x><y>22</y><width>1860</width><height>20</height></rect></property>
+     <property name="value"><number>0</number></property>
+     <property name="maximum"><number>4</number></property>
+    </widget>
+    <widget class="QPlainTextEdit" name="plainTextEditShutdown">
+     <property name="geometry"><rect><x>10</x><y>48</y><width>1860</width><height>160</height></rect></property>
+     <property name="readOnly"><bool>true</bool></property>
+    </widget>
+   </widget>
+
+  </widget>
+  <!-- end centralwidget -->
+
+  <widget class="QMenuBar" name="menubar">
+   <property name="geometry"><rect><x>0</x><y>0</y><width>1908</width><height>22</height></rect></property>
+  </widget>
+  <widget class="QStatusBar" name="statusbar"/>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>
