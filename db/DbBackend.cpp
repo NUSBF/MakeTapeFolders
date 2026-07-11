@@ -37,8 +37,12 @@ DbBackend::~DbBackend()
     QMutexLocker lk(&m_mutex);
     qDeleteAll(m_doneInsertStmt);
     qDeleteAll(m_scanInsertStmt);
+    qDeleteAll(m_sourceFileSizeStmt);
+    qDeleteAll(m_orphanInsertStmt);
     m_doneInsertStmt.clear();
     m_scanInsertStmt.clear();
+    m_sourceFileSizeStmt.clear();
+    m_orphanInsertStmt.clear();
 }
 
 QString DbBackend::ignoreInsertPrefix() const
@@ -134,12 +138,38 @@ void DbBackend::closeThreadConnection()
             delete sit.value();
             m_scanInsertStmt.erase(sit);
         }
+        if (auto sit = m_sourceFileSizeStmt.find(t); sit != m_sourceFileSizeStmt.end()) {
+            delete sit.value();
+            m_sourceFileSizeStmt.erase(sit);
+        }
+        if (auto sit = m_orphanInsertStmt.find(t); sit != m_orphanInsertStmt.end()) {
+            delete sit.value();
+            m_orphanInsertStmt.erase(sit);
+        }
     }
     {
         QSqlDatabase db = QSqlDatabase::database(name, false);
         if (db.isOpen()) db.close();
     }
     QSqlDatabase::removeDatabase(name);
+}
+
+QSqlQuery* DbBackend::cachedStmt(QMap<QThread*, QSqlQuery*>& cache, const QString& sql)
+{
+    QThread* t = QThread::currentThread();
+    QSqlQuery* q = nullptr;
+    {
+        QMutexLocker lk(&m_mutex);
+        q = cache.value(t, nullptr);
+    }
+    if (!q) {
+        QSqlDatabase db = connection();
+        q = new QSqlQuery(db);
+        q->prepare(sql);
+        QMutexLocker lk(&m_mutex);
+        cache.insert(t, q);
+    }
+    return q;
 }
 
 void DbBackend::interrupt()
@@ -451,20 +481,9 @@ void DbBackend::deleteScanForSource(const QString& sourceRoot)
 
 void DbBackend::insertScannedFile(const FileRow& row)
 {
-    QThread* t = QThread::currentThread();
-    QSqlQuery* q = nullptr;
-    {
-        QMutexLocker lk(&m_mutex);
-        q = m_scanInsertStmt.value(t, nullptr);
-    }
-    if (!q) {
-        QSqlDatabase db = connection();
-        q = new QSqlQuery(db);
-        q->prepare(QString("%1 INTO files(source_root,src,src_hash,size,ext,folder,mtime,scanned_at)"
-                            " VALUES(?,?,?,?,?,?,?,?)").arg(replaceInsertPrefix()));
-        QMutexLocker lk(&m_mutex);
-        m_scanInsertStmt.insert(t, q);
-    }
+    QSqlQuery* q = cachedStmt(m_scanInsertStmt,
+        QString("%1 INTO files(source_root,src,src_hash,size,ext,folder,mtime,scanned_at)"
+                " VALUES(?,?,?,?,?,?,?,?)").arg(replaceInsertPrefix()));
     q->bindValue(0, row.source_root);
     q->bindValue(1, row.src);
     q->bindValue(2, computeSrcHash(row.source_root, row.src));
@@ -568,16 +587,17 @@ FolderTotals DbBackend::sumDoneBytesForFolder(const QString& sourceRoot, const Q
 
 bool DbBackend::sourceFileSize(const QString& sourceRoot, const QString& src, qint64* outSize)
 {
-    QSqlDatabase db = connection();
-    QSqlQuery q(db);
     // Indexed lookup via src_hash (source_root, src) has no standalone index
     // since only (source_root, src_hash) is the key — this is why the hash
     // is the exact-match path everywhere, and `src`/`dst` stay for LIKE/display.
-    q.prepare("SELECT size FROM files WHERE source_root = ? AND src_hash = ?");
-    q.addBindValue(sourceRoot);
-    q.addBindValue(computeSrcHash(sourceRoot, src));
-    if (q.exec() && q.next()) {
-        if (outSize) *outSize = q.value(0).toLongLong();
+    // Cached: called once per file during Phase 2 orphan reconciliation, so a
+    // fresh prepare() per call is not acceptable (seconds each over NFS).
+    QSqlQuery* q = cachedStmt(m_sourceFileSizeStmt,
+        "SELECT size FROM files WHERE source_root = ? AND src_hash = ?");
+    q->bindValue(0, sourceRoot);
+    q->bindValue(1, computeSrcHash(sourceRoot, src));
+    if (q->exec() && q->next()) {
+        if (outSize) *outSize = q->value(0).toLongLong();
         return true;
     }
     return false;
@@ -586,18 +606,19 @@ bool DbBackend::sourceFileSize(const QString& sourceRoot, const QString& src, qi
 void DbBackend::insertOrphanDone(const QString& sourceRoot, const QString& src, const QString& dst,
                                   qint64 bytes, qint64 gzBytes, double ratio)
 {
-    QSqlDatabase db = connection();
-    QSqlQuery q(db);
-    q.prepare(QString("%1 INTO done(source_root,src,src_hash,dst,bytes,gz_bytes,ratio,read_ms,compress_ms,write_ms)"
-                       " VALUES(?,?,?,?,?,?,?,0,0,0)").arg(ignoreInsertPrefix()));
-    q.addBindValue(sourceRoot);
-    q.addBindValue(src);
-    q.addBindValue(computeSrcHash(sourceRoot, src));
-    q.addBindValue(dst);
-    q.addBindValue(bytes);
-    q.addBindValue(gzBytes);
-    q.addBindValue(ratio);
-    q.exec();
+    // Cached for the same reason as sourceFileSize() above — called once per
+    // reconciled orphan file.
+    QSqlQuery* q = cachedStmt(m_orphanInsertStmt,
+        QString("%1 INTO done(source_root,src,src_hash,dst,bytes,gz_bytes,ratio,read_ms,compress_ms,write_ms)"
+                " VALUES(?,?,?,?,?,?,?,0,0,0)").arg(ignoreInsertPrefix()));
+    q->bindValue(0, sourceRoot);
+    q->bindValue(1, src);
+    q->bindValue(2, computeSrcHash(sourceRoot, src));
+    q->bindValue(3, dst);
+    q->bindValue(4, bytes);
+    q->bindValue(5, gzBytes);
+    q->bindValue(6, ratio);
+    q->exec();
 }
 
 qint64 DbBackend::countRemaining(const QString& sourceRoot)
@@ -651,21 +672,10 @@ bool DbBackend::RemainingCursor::next(QString& src, qint64& size)
 
 void DbBackend::insertDone(const DoneRow& row)
 {
-    QThread* t = QThread::currentThread();
-    QSqlQuery* q = nullptr;
-    {
-        QMutexLocker lk(&m_mutex);
-        q = m_doneInsertStmt.value(t, nullptr);
-    }
-    if (!q) {
-        QSqlDatabase db = connection();
-        q = new QSqlQuery(db);
-        q->prepare(QString("%1 INTO done"
-                            "(source_root,src,src_hash,dst,bytes,gz_bytes,ratio,read_ms,compress_ms,write_ms)"
-                            " VALUES(?,?,?,?,?,?,?,?,?,?)").arg(ignoreInsertPrefix()));
-        QMutexLocker lk(&m_mutex);
-        m_doneInsertStmt.insert(t, q);
-    }
+    QSqlQuery* q = cachedStmt(m_doneInsertStmt,
+        QString("%1 INTO done"
+                "(source_root,src,src_hash,dst,bytes,gz_bytes,ratio,read_ms,compress_ms,write_ms)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?)").arg(ignoreInsertPrefix()));
     q->bindValue(0, row.source_root);
     q->bindValue(1, row.src);
     q->bindValue(2, computeSrcHash(row.source_root, row.src));
@@ -688,11 +698,21 @@ QVector<FileRow> DbBackend::fetchFilesPage(const QString& afterSourceRoot, const
     QSqlDatabase db = connection();
     QSqlQuery q(db);
     q.setForwardOnly(true);
+    // Also expanded from the row-value form "(source_root, src_hash) > (?, ?)"
+    // to this OR-equivalent for portability across both drivers/dialects.
     q.prepare("SELECT source_root, src, size, ext, folder, mtime, scanned_at FROM files "
-              "WHERE (source_root, src_hash) > (?, ?) "
+              "WHERE source_root > ? OR (source_root = ? AND src_hash > ?) "
               "ORDER BY source_root, src_hash LIMIT ?");
-    q.addBindValue(afterSourceRoot);
-    q.addBindValue(afterHash);
+    // A default-constructed QString()/QByteArray() (the "start from the
+    // beginning" sentinel callers pass) binds as SQL NULL, not empty
+    // string/blob — and NULL comparisons are never true, silently matching
+    // zero rows. Normalize to non-null empty values here so callers don't
+    // need to know about this.
+    QString afterRoot = afterSourceRoot.isNull() ? QString("") : afterSourceRoot;
+    QByteArray afterH  = afterHash.isNull() ? QByteArray("") : afterHash;
+    q.addBindValue(afterRoot);
+    q.addBindValue(afterRoot);
+    q.addBindValue(afterH);
     q.addBindValue(limit);
     QVector<FileRow> out;
     if (q.exec()) {
@@ -718,11 +738,16 @@ QVector<DoneRow> DbBackend::fetchDonePage(const QString& afterSourceRoot, const 
     QSqlDatabase db = connection();
     QSqlQuery q(db);
     q.setForwardOnly(true);
+    // See fetchFilesPage() above for both the OR-equivalent rewrite and the
+    // null-vs-empty-string binding fix.
     q.prepare("SELECT source_root, src, dst, bytes, gz_bytes, ratio, read_ms, compress_ms, write_ms FROM done "
-              "WHERE (source_root, src_hash) > (?, ?) "
+              "WHERE source_root > ? OR (source_root = ? AND src_hash > ?) "
               "ORDER BY source_root, src_hash LIMIT ?");
-    q.addBindValue(afterSourceRoot);
-    q.addBindValue(afterHash);
+    QString afterRoot = afterSourceRoot.isNull() ? QString("") : afterSourceRoot;
+    QByteArray afterH  = afterHash.isNull() ? QByteArray("") : afterHash;
+    q.addBindValue(afterRoot);
+    q.addBindValue(afterRoot);
+    q.addBindValue(afterH);
     q.addBindValue(limit);
     QVector<DoneRow> out;
     if (q.exec()) {

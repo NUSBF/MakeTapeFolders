@@ -63,6 +63,12 @@ private:
     std::atomic<int> filesInWriteMap{0};
     std::atomic<int> filesBeingWritten{0};
 
+    // Which stage of runBackup() is currently active, so initiateShutdown()
+    // can report accurately instead of always saying "waiting for writer" —
+    // that's only true once Phase 3 (the write pipeline) has actually
+    // started. See BackupPhase in mainwindow.cpp.
+    std::atomic<int> currentBackupPhase{0};
+
     QTimer*       m_pipelineTimer   = nullptr;
     QTimer*       m_dbLoadDispTimer = nullptr;
     QElapsedTimer m_dbLoadTimer;

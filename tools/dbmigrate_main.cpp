@@ -10,6 +10,7 @@
 #include <QByteArray>
 #include <QCoreApplication>
 #include <QDebug>
+#include <QElapsedTimer>
 #include <QString>
 #include <cstdio>
 #include <unistd.h>
@@ -42,9 +43,59 @@ int main(int argc, char* argv[])
     prependExeDirToPluginPath();
     QCoreApplication app(argc, argv);
 
-    if (argc != 2 || (QString(argv[1]) != "sqlite" && QString(argv[1]) != "mariadb")) {
+    bool isStats = argc == 3 && QString(argv[1]) == "stats";
+    bool isBench = argc == 2 && QString(argv[1]) == "bench";
+    bool isKind  = argc == 2 && (QString(argv[1]) == "sqlite" || QString(argv[1]) == "mariadb");
+    if (!isStats && !isBench && !isKind) {
         fprintf(stderr, "Usage: %s <sqlite|mariadb>\n", argv[0]);
+        fprintf(stderr, "       %s stats <sourceRoot>   (diagnostic: time statsForSource() against sqlite)\n", argv[0]);
+        fprintf(stderr, "       %s bench                (diagnostic: time sourceFileSize()/insertOrphanDone() in a loop)\n", argv[0]);
         return 2;
+    }
+
+    if (isStats) {
+        DbBackend db(DbBackend::Kind::Sqlite);
+        QString err;
+        if (!db.ensureSchema(&err)) {
+            fprintf(stderr, "ensureSchema FAILED: %s\n", qPrintable(err));
+            return 1;
+        }
+        QElapsedTimer t; t.start();
+        SourceStats s = db.statsForSource(QString::fromUtf8(argv[2]));
+        fprintf(stdout, "statsForSource(%s) took %lld ms — total=%lld done=%lld\n",
+                argv[2], (long long)t.elapsed(), (long long)s.totalFiles, (long long)s.doneFiles);
+        db.closeThreadConnection();
+        return 0;
+    }
+
+    if (isBench) {
+        DbBackend db(DbBackend::Kind::Sqlite);
+        QString err;
+        if (!db.ensureSchema(&err)) {
+            fprintf(stderr, "ensureSchema FAILED: %s\n", qPrintable(err));
+            return 1;
+        }
+        QVector<FileRow> rows = db.fetchFilesPage(QString(), QByteArray(), 2000);
+        if (rows.isEmpty()) {
+            fprintf(stderr, "no rows to bench against\n");
+            return 1;
+        }
+        QElapsedTimer t; t.start();
+        qint64 sz = 0;
+        for (const FileRow& r : rows) db.sourceFileSize(r.source_root, r.src, &sz);
+        qint64 lookupMs = t.elapsed();
+        fprintf(stdout, "sourceFileSize() x %d: %lld ms total, %.3f ms/call\n",
+                rows.size(), (long long)lookupMs, lookupMs / (double)rows.size());
+
+        t.restart();
+        for (const FileRow& r : rows)
+            db.insertOrphanDone(r.source_root, r.src, "bench/dst", r.size, r.size, 1.0);
+        qint64 insertMs = t.elapsed();
+        fprintf(stdout, "insertOrphanDone() x %d: %lld ms total, %.3f ms/call\n",
+                rows.size(), (long long)insertMs, insertMs / (double)rows.size());
+
+        db.closeThreadConnection();
+        return 0;
     }
 
     DbBackend::Kind kind = (QString(argv[1]) == "sqlite")

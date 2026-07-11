@@ -34,6 +34,27 @@
 static constexpr DbBackend::Kind kActiveBackend = DbBackend::Kind::Sqlite;
 
 // ---------------------------------------------------------------------------
+// runBackup() phase tracking — read by initiateShutdown() so its status
+// messages reflect what's actually running instead of always saying
+// "waiting for writer" (only true once Phase 3 starts).
+// ---------------------------------------------------------------------------
+
+static constexpr int kBackupPhaseIdle          = 0;
+static constexpr int kBackupPhaseVerify        = 1; // Phase 1: validate done table
+static constexpr int kBackupPhaseOrphanScan    = 2; // Phase 2: orphan scan + size check
+static constexpr int kBackupPhasePipeline      = 3; // Phase 3: read/compress/write pipeline
+
+static const char* backupPhaseLabel(int phase)
+{
+    switch (phase) {
+        case kBackupPhaseVerify:     return "Phase 1 (verifying done table)";
+        case kBackupPhaseOrphanScan: return "Phase 2 (orphan scan)";
+        case kBackupPhasePipeline:   return "Phase 3 (write pipeline)";
+        default:                     return "no backup phase";
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Per-file on-tape bytes when written with tar (always >= LTFS, so staying
 // under 12 TB with this number guarantees fit on tape for both tar and LTFS).
 //   tar:  512 header + data rounded up to 512-byte boundary
@@ -289,18 +310,34 @@ void MainWindow::initiateShutdown()
 
         // Steps 2+3: wait for compress pool (drains inside runBackup() automatically
         // after reader loop breaks) and for writer to finish its queue.
+        //
+        // Only meaningful once Phase 3 (the write pipeline) has actually
+        // started — filesInWriteMap/filesBeingWritten are legitimately 0
+        // during Phase 1 (verify) or Phase 2 (orphan scan), which don't use
+        // the pipeline at all. Report whichever is actually running instead
+        // of always describing this as "waiting for writer".
+        int phase = currentBackupPhase.load();
         int files = filesInWriteMap.load() + filesBeingWritten.load();
         int writer_timeout_ms = files > 0 ? files * 60000 : 10000;
         log("  [2/4] Waiting for compress pool...", 2);
-        log(QString("  [3/4] Waiting for writer (%1 file%2, max %3 min)...")
-                .arg(files).arg(files == 1 ? "" : "s")
-                .arg(writer_timeout_ms / 60000), 3);
+        if (phase == kBackupPhasePipeline) {
+            log(QString("  [3/4] Waiting for writer (%1 file%2, max %3 min)...")
+                    .arg(files).arg(files == 1 ? "" : "s")
+                    .arg(writer_timeout_ms / 60000), 3);
+        } else {
+            log(QString("  [3/4] Waiting for %1 to reach a stop point (max %2 s)...")
+                    .arg(backupPhaseLabel(phase))
+                    .arg(writer_timeout_ms / 1000), 3);
+        }
 
         if (waitWithTimeout(writer_timeout_ms)) {
             log("         All threads done.", 4);
         } else {
-            log(QString("         Writer timeout after %1 min — forcing stop...")
-                    .arg(writer_timeout_ms / 60000));
+            log(QString("         %1 timeout after %2 — forcing stop...")
+                    .arg(phase == kBackupPhasePipeline ? "Writer" : backupPhaseLabel(phase))
+                    .arg(phase == kBackupPhasePipeline
+                             ? QString("%1 min").arg(writer_timeout_ms / 60000)
+                             : QString("%1 s").arg(writer_timeout_ms / 1000)));
             forceKillWriter.store(true);
             // Writer checks forceKillWriter every 200 ms in its wait loop
             if (waitWithTimeout(60000)) {
@@ -317,9 +354,9 @@ void MainWindow::initiateShutdown()
                 // instead of looping. Each successful file already committed
                 // its own DB transaction, so the DB is consistent up to the
                 // last file actually written.
-                log("         WARNING: backup thread still stuck (likely a read "
-                    "blocked on NFS, which cannot be cancelled) — force-quitting "
-                    "now instead of hanging indefinitely.", 4);
+                log(QString("         WARNING: backup thread still stuck in %1 (likely a "
+                    "blocked NFS read/stat that cannot be cancelled) — force-quitting "
+                    "now instead of hanging indefinitely.").arg(backupPhaseLabel(phase)), 4);
                 qDebug() << "[STOP] backup thread unresponsive after force-kill — hard exit";
                 std::_Exit(0);
             }
@@ -824,6 +861,7 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
             }
             ui->labelStopWarning->setVisible(false);
         }, Qt::QueuedConnection);
+        currentBackupPhase.store(kBackupPhaseIdle);
     };
 
     // ── Count indexed files to detect missing DB scan ─────────────────────
@@ -836,6 +874,7 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
         }
     }
 
+    currentBackupPhase.store(kBackupPhaseVerify);
     qDebug() << "[BACKUP] ── Phase 1: validate done table ──────────────────────────";
     // Only validate files in the current (last) tape folder — completed tapes are not re-checked.
     QStringList existingFoldersP1 = QDir(destBase).entryList(
@@ -886,6 +925,11 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
             if (stopRequested.load()) break;
             verifyPool.start([this, item, &checked, &bytesChecked,
                               &removeMutex, &toRemove, &verifyTimer, doneTotal] {
+                // Tasks already queued (not yet started) when stop is
+                // requested skip their blocking file work entirely instead
+                // of running to completion — bounds how long
+                // verifyPool.waitForDone() below takes to drain.
+                if (stopRequested.load()) return;
                 bool ok = QFileInfo::exists(item.dstFull) &&
                           isValidGzip(item.dstFull, item.wasAlreadyGz ? -1 : item.origSize);
                 if (!ok) {
@@ -944,8 +988,9 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
         } // end else (currentFolderName not empty)
     }
 
-    if (stopRequested.load()) { setStatus("Stopped."); return; }
+    if (stopRequested.load()) { setStatus("Stopped."); reenable(); return; }
 
+    currentBackupPhase.store(kBackupPhaseOrphanScan);
     qDebug() << "[BACKUP] ── Phase 2: orphan scan + size check ────────────────────";
     // ── Phase 2: scan destination folders — size-check + orphan reconcile ────
     //
@@ -1061,6 +1106,10 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
                 }
 
                 // ── Orphan file: not recorded in done ────────────────────────
+                // Guard the blocking isValidGzip() read below — cheap now that
+                // sourceFileSize()/insertOrphanDone() are fast, but this still
+                // avoids starting a fresh orphan's file read after a stop.
+                if (stopRequested.load()) break;
                 QString fileRel = absPath.mid(folderPath.length());
                 if (fileRel.startsWith('/')) fileRel = fileRel.mid(1);
 
@@ -1187,7 +1236,7 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
             .arg(QString::number(totalS, 'f', 1)));
     }
 
-    if (stopRequested.load()) { setStatus("Stopped."); return; }
+    if (stopRequested.load()) { setStatus("Stopped."); reenable(); return; }
 
     // ── Count remaining files + bytes for progress bar ───────────────────
     qint64 totalRemaining    = 0;
@@ -1552,6 +1601,7 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize)
         m_db->commitTxn();
         m_db->closeThreadConnection();   // this thread (writerThread) is about to exit
     });
+    currentBackupPhase.store(kBackupPhasePipeline);
     qDebug() << "[BACKUP] ── Phase 3: pipeline starting ───────────────────────────";
     qDebug() << "[BACKUP] remaining:" << totalRemaining
              << "| source:" << (srcIsNFS ? "NFS" : "local")

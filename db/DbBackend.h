@@ -111,11 +111,20 @@ private:
     QString ignoreInsertPrefix() const;  // "INSERT OR IGNORE" (sqlite) / "INSERT IGNORE" (mariadb)
     QString replaceInsertPrefix() const; // "INSERT OR REPLACE" (sqlite) / "REPLACE" (mariadb)
 
+    // Returns the calling thread's cached prepared statement for `sql`,
+    // creating and preparing it on first use. Every hot-path query (called
+    // more than once per backup run) must go through this — a fresh
+    // QSqlQuery::prepare() per call costs seconds over NFS, whereas a
+    // cached statement reused via bindValue()+exec() does not.
+    QSqlQuery* cachedStmt(QMap<QThread*, QSqlQuery*>& cache, const QString& sql);
+
     Kind m_kind;
     QMutex m_mutex;
-    QMap<QThread*, QString> m_connNames;         // calling thread -> unique QSqlDatabase connection name
-    QMap<QThread*, QSqlQuery*> m_doneInsertStmt; // per-thread prepared INSERT for insertDone()
-    QMap<QThread*, QSqlQuery*> m_scanInsertStmt; // per-thread prepared INSERT for insertScannedFile()
+    QMap<QThread*, QString> m_connNames;             // calling thread -> unique QSqlDatabase connection name
+    QMap<QThread*, QSqlQuery*> m_doneInsertStmt;     // per-thread prepared INSERT for insertDone()
+    QMap<QThread*, QSqlQuery*> m_scanInsertStmt;     // per-thread prepared INSERT for insertScannedFile()
+    QMap<QThread*, QSqlQuery*> m_sourceFileSizeStmt; // per-thread prepared SELECT for sourceFileSize()
+    QMap<QThread*, QSqlQuery*> m_orphanInsertStmt;   // per-thread prepared INSERT for insertOrphanDone()
 };
 
 #endif // DBBACKEND_H
