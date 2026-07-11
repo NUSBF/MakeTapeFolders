@@ -332,12 +332,22 @@ void MainWindow::initiateShutdown()
 
         if (waitWithTimeout(writer_timeout_ms)) {
             log("         All threads done.", 4);
+        } else if (phase != kBackupPhasePipeline) {
+            // Not in the write pipeline — there is no writer thread for
+            // forceKillWriter to signal, so waiting on it is pure dead time.
+            // Whatever is stuck is a single blocking NFS call inside
+            // Phase 1/2 (QFileInfo::exists/isValidGzip/a DB query) that
+            // cannot be cancelled from here either way — an extra wait
+            // changes nothing, so go straight to the hard exit instead of
+            // wasting another 60s on a mechanism that doesn't apply.
+            log(QString("         WARNING: %1 still stuck after %2 s (likely a blocked NFS "
+                "read/stat that cannot be cancelled) — force-quitting now instead of "
+                "hanging indefinitely.").arg(backupPhaseLabel(phase)).arg(writer_timeout_ms / 1000), 4);
+            qDebug() << "[STOP] backup thread unresponsive in" << backupPhaseLabel(phase) << "— hard exit";
+            std::_Exit(0);
         } else {
-            log(QString("         %1 timeout after %2 — forcing stop...")
-                    .arg(phase == kBackupPhasePipeline ? "Writer" : backupPhaseLabel(phase))
-                    .arg(phase == kBackupPhasePipeline
-                             ? QString("%1 min").arg(writer_timeout_ms / 60000)
-                             : QString("%1 s").arg(writer_timeout_ms / 1000)));
+            log(QString("         Writer timeout after %1 min — forcing stop...")
+                    .arg(writer_timeout_ms / 60000));
             forceKillWriter.store(true);
             // Writer checks forceKillWriter every 200 ms in its wait loop
             if (waitWithTimeout(60000)) {
@@ -354,9 +364,9 @@ void MainWindow::initiateShutdown()
                 // instead of looping. Each successful file already committed
                 // its own DB transaction, so the DB is consistent up to the
                 // last file actually written.
-                log(QString("         WARNING: backup thread still stuck in %1 (likely a "
-                    "blocked NFS read/stat that cannot be cancelled) — force-quitting "
-                    "now instead of hanging indefinitely.").arg(backupPhaseLabel(phase)), 4);
+                log("         WARNING: writer thread still stuck (likely a blocked NFS "
+                    "read/stat that cannot be cancelled) — force-quitting now instead of "
+                    "hanging indefinitely.", 4);
                 qDebug() << "[STOP] backup thread unresponsive after force-kill — hard exit";
                 std::_Exit(0);
             }
