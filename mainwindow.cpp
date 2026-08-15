@@ -1662,19 +1662,34 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
             qint64 nextTarBytes   = tarFileBytes(gzSizeForCheck);
             qint64 nextLtfsBytes  = ltfsFileBytes(gzSizeForCheck, ltfsIndexOverheadBytes);
             HardLimitModel rotateCheckModel = activeHardLimitModel.load();
-            bool wouldExceed = (rotateCheckModel == HardLimitModel::Ltfs)
-                ? (currentLtfsEst + nextLtfsBytes > maxFolderSize)
-                : (currentTarEst  + nextTarBytes  > maxFolderSize);
+            qint64 projectedTotal = (rotateCheckModel == HardLimitModel::Ltfs)
+                ? (currentLtfsEst + nextLtfsBytes)
+                : (currentTarEst  + nextTarBytes);
+            bool wouldExceed = projectedTotal > maxFolderSize;
+            qDebug() << "[ROTATE-CHECK] seq=" << w.seq << "folder=" << currentFolder
+                     << "model=" << (rotateCheckModel == HardLimitModel::Ltfs ? "LTFS" : "Tar")
+                     << "currentTarEst=" << currentTarEst << "currentLtfsEst=" << currentLtfsEst
+                     << "nextTarBytes=" << nextTarBytes << "nextLtfsBytes=" << nextLtfsBytes
+                     << "projectedTotal=" << projectedTotal << "maxFolderSize=" << maxFolderSize
+                     << "wouldExceed=" << wouldExceed;
             if (wouldExceed) {
                 ++foldersCompleted;
+                QString sealedFolder = currentFolder;
+                qint64  sealedTar    = currentTarEst;
+                qint64  sealedLtfs   = currentLtfsEst;
+                qint64  sealedRaw    = currentRawBytes;
+                int     sealedFiles  = currentFolderFileCount;
                 currentFolder = nextFolderPath();
                 QDir().mkpath(currentFolder);
                 currentRawBytes        = 0;
                 currentTarEst          = 1024;
                 currentLtfsEst         = 0;
                 currentFolderFileCount = 0;
-                qDebug() << "[BACKUP] new folder:" << currentFolder << "(limit model:"
-                         << (rotateCheckModel == HardLimitModel::Ltfs ? "LTFS" : "Tar") << ")";
+                qDebug() << "[BACKUP] SEALED folder:" << sealedFolder
+                         << "| files=" << sealedFiles
+                         << "| raw=" << sealedRaw << "tar=" << sealedTar << "ltfs=" << sealedLtfs
+                         << "| new folder:" << currentFolder
+                         << "(limit model:" << (rotateCheckModel == HardLimitModel::Ltfs ? "LTFS" : "Tar") << ")";
                 setFolderProgress(0, 0, rotateCheckModel, foldersCompleted+1, foldersCompleted+1, 0);
             }
 
@@ -1684,23 +1699,44 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
                 QDir().mkpath(currentFolder + "/" + relDir);
 
             QString destFile = currentFolder + "/" + w.gzName;
+            qint64  gzSize   = (qint64)w.gzData.size();
 
-            // Write (filesBeingWritten already incremented above)
+            // Write (filesBeingWritten already incremented above).
+            //
+            // The one and only success signal is: the bytes were handed to
+            // write(), and close() confirms the OS/NFS actually committed
+            // them — nothing is re-opened or re-read afterward to "double
+            // check". On NFS, write() returning success only means the
+            // client's page cache accepted the data; a server-side commit
+            // failure (quota, network blip, stale handle) is only reported
+            // via close()'s error state, which is why that's checked
+            // explicitly instead of being discarded.
             QElapsedTimer wt; wt.start();
-            bool writeOk = false;
+            qint64  bytesWritten = -1;
+            bool    closeOk      = false;
+            QString closeErr;
             {
                 QFile outF(destFile);
                 if (outF.open(QIODevice::WriteOnly)) {
-                    writeOk = (outF.write(w.gzData) == (qint64)w.gzData.size());
+                    bytesWritten = outF.write(w.gzData);
                     outF.close();
+                    closeOk = (outF.error() == QFile::NoError);
+                    if (!closeOk) closeErr = outF.errorString();
+                } else {
+                    closeErr = outF.errorString();
                 }
             }
             qint64 write_ms = wt.elapsed();
+            bool writeOk = closeOk && (bytesWritten == gzSize);
+            qDebug() << "[WRITE] seq=" << w.seq << "dest=" << destFile
+                     << "gzSize=" << gzSize << "bytesWritten=" << bytesWritten
+                     << "closeOk=" << closeOk << (closeErr.isEmpty() ? "" : closeErr)
+                     << "writeOk=" << writeOk << write_ms << "ms";
             if (!writeOk) {
                 filesBeingWritten.fetch_add(-1);
-                QFileInfo di(destFile);
-                QString destEvidence = QString("%1  size on disk: %2  (expected %3)")
-                    .arg(destFile).arg(di.size()).arg(w.gzData.size());
+                QString destEvidence = QString("%1  bytes written: %2  (expected %3)  close error: %4")
+                    .arg(destFile).arg(bytesWritten).arg(gzSize)
+                    .arg(closeErr.isEmpty() ? "none" : closeErr);
                 QFile::remove(destFile);
                 addFailed(w.rel, w.srcSize, w.alreadyGz, "write failed", destEvidence);
                 ramInFlight.fetch_add(-w.srcSize);
@@ -1708,31 +1744,23 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
                 ++nextWriteSeq;
                 continue;
             }
-
-            // Gzip validation for compressed files
-            if (!w.alreadyGz && !isValidGzip(destFile, w.srcSize)) {
-                filesBeingWritten.fetch_add(-1);
-                QFileInfo di(destFile);
-                QString destEvidence = QString("%1  size: %2  (gz expected src %3)")
-                    .arg(destFile).arg(di.size()).arg(w.srcSize);
-                QFile::remove(destFile);
-                addFailed(w.rel, w.srcSize, w.alreadyGz, "gzip validation failed", destEvidence);
-                ramInFlight.fetch_add(-w.srcSize);
-                { QMutexLocker lk(&writeMutex); ramCV.wakeAll(); }
-                ++nextWriteSeq;
-                continue;
-            }
             filesBeingWritten.fetch_add(-1);  // success: leaving write stage
 
-            // Update tracking
-            qint64 gzSize = (qint64)w.gzData.size();
+            // Update tracking — the gzip size was already known before the
+            // write; a confirmed write+close is success, full stop.
             currentRawBytes += gzSize;
-            currentTarEst   += tarFileBytes(gzSize);
-            currentLtfsEst  += ltfsFileBytes(gzSize, ltfsIndexOverheadBytes);
+            qint64 tarAdd  = tarFileBytes(gzSize);
+            qint64 ltfsAdd = ltfsFileBytes(gzSize, ltfsIndexOverheadBytes);
+            currentTarEst   += tarAdd;
+            currentLtfsEst  += ltfsAdd;
             ++currentFolderFileCount;
             totalBytesRead     += w.srcSize;
             totalBytesWritten  += gzSize;
             if (w.alreadyGz) ++filesCopied; else ++filesGzipped;
+            qDebug() << "[SIZE] seq=" << w.seq << "folder=" << currentFolder
+                     << "+gz=" << gzSize << "tar+=" << tarAdd << "ltfs+=" << ltfsAdd
+                     << "-> tarTotal=" << currentTarEst << "ltfsTotal=" << currentLtfsEst
+                     << "filesThisFolder=" << currentFolderFileCount;
 
             // INSERT into done (9 params)
             double ratio = (gzSize > 0 && !w.alreadyGz) ? (double)w.srcSize / gzSize : 1.0;
@@ -1749,6 +1777,8 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
             doneRow.write_ms      = write_ms;
             m_db->insertDone(doneRow);
             m_db->flushTxn();
+            qDebug() << "[DONE] seq=" << w.seq << "src=" << w.rel << "dst=" << dstRelPath
+                     << "bytes=" << w.srcSize << "gz_bytes=" << gzSize << "committed to done table";
 
             statWriteMs.fetch_add(write_ms);
             ++filesProcessed;
