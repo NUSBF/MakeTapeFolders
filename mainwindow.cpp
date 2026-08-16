@@ -1074,6 +1074,23 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
             }
         }
 
+        // Nothing to verify — the per-item loop below never runs, so
+        // without an explicit message here Phase 1's own section shows
+        // nothing durable: the shared labelBackupStatus line above did get
+        // "Verifying 0 files..." for a moment, but Phase 2 overwrites that
+        // shared line almost immediately, leaving no lasting evidence in
+        // Phase 1's own dedicated widgets that it ran and found nothing.
+        if (verifyItems.empty()) {
+            QMetaObject::invokeMethod(this, [this, folderDoneCount, currentFolderName] {
+                ui->progressBarVerify->setMinimum(0);
+                ui->progressBarVerify->setMaximum(1);
+                ui->progressBarVerify->setValue(1);
+                ui->labelVerifyStats->setText(
+                    QString("%1: %2 done rows — nothing to verify")
+                        .arg(currentFolderName).arg(folderDoneCount));
+            }, Qt::QueuedConnection);
+        }
+
         // Verify in parallel — each check is independent (NFS stat + read 6 bytes)
         QMutex                              removeMutex;
         QList<QPair<QString,QString>>       toRemove;  // {src, dstFull}
