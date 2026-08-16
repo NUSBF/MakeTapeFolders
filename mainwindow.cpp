@@ -977,6 +977,19 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
                 m_pipelineTimer->deleteLater();
                 m_pipelineTimer = nullptr;
             }
+            // Stopping the timer only stops future updates — it leaves
+            // whatever counts were on screen at the last tick, which then
+            // sit there looking like a live in-flight state (queued/writing/
+            // active) forever, even though the pipeline is fully idle.
+            // Reset to the true idle state explicitly.
+            ui->labelReadCount->setText("0");
+            ui->labelReadDetail->setText("");
+            ui->labelCompressCount->setText("0");
+            ui->labelCompressDetail->setText("");
+            ui->labelQueueCount->setText("0");
+            ui->labelQueueDetail->setText("");
+            ui->labelWriteCount->setText("0");
+            ui->labelWriteDetail->setText("");
             ui->labelStopWarning->setVisible(false);
         }, Qt::QueuedConnection);
         currentBackupPhase.store(kBackupPhaseIdle);
