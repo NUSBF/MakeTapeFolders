@@ -2337,6 +2337,36 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
             .arg(QString::number(totalS,'f',1))
             .arg(QString::number(ratio,'f',2))
             .arg(QLocale().formattedDataSize(totalBytesWritten)));
+    } else {
+        // A stop mid-pipeline previously left whatever the last per-file
+        // "Writing [X/Y]: ..." status happened to be as the permanent
+        // on-screen text — nothing here ever replaced it, so it looked like
+        // a live in-flight state forever after the run had actually
+        // stopped. Give stop the same explicit final message completion
+        // already gets.
+        setStatus(QString("Stopped after %1 files in %2 s  —  written %3")
+            .arg(filesProcessed)
+            .arg(QString::number(totalS,'f',1))
+            .arg(QLocale().formattedDataSize(totalBytesWritten)));
+    }
+
+    // labelStats has the same problem as labelBackupStatus did — it's only
+    // ever written by m_pipelineTimer's 250ms tick, which reenable() (below)
+    // is about to stop for good. Without a final write here it freezes on
+    // whatever the last tick happened to show, using the same live-rate
+    // fields (ETA, RAM in flight) that are meaningless once nothing is
+    // running. Give it one last, explicitly final value instead.
+    {
+        qint64 finalDone = (qint64)(doneTotal + filesProcessed);
+        QString finalFolder = QDir(currentFolder).dirName();
+        QString finalState = stopRequested.load() ? "stopped" : "completed";
+        QMetaObject::invokeMethod(this, [this, finalDone, finalFolder, finalState] {
+            ui->labelStats->setText(
+                QString("done: %1  |  %2  |  folder: %3")
+                    .arg(QLocale().toString(finalDone))
+                    .arg(finalState)
+                    .arg(finalFolder));
+        }, Qt::QueuedConnection);
     }
 
     setProgressVal(filesProcessed);
