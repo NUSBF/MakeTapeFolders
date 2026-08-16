@@ -1230,10 +1230,18 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
             qint64 lastConsoleLogMs  = 0; // time-based console progress, see below
 
             {
-                int dc = std::max(doneCount, 1);
-                QMetaObject::invokeMethod(this, [this, dc] {
-                    ui->progressBarOrphan->setMaximum(dc);
-                    ui->progressBarOrphan->setValue(0);
+                // The real file count on disk isn't known until the walk
+                // below finishes — doneCount (the done-table row count going
+                // in) is not that number and can be far off it (e.g. 0 right
+                // after a reset), so using it as the bar's maximum previously
+                // left the bar clamped near-empty for the whole walk even as
+                // labelOrphanStats reported real, accurate progress. Busy/
+                // indeterminate mode (min=max=0) is honest about not knowing
+                // the total; set to a real determinate 100% once the walk
+                // completes, below.
+                QMetaObject::invokeMethod(this, [this] {
+                    ui->progressBarOrphan->setMinimum(0);
+                    ui->progressBarOrphan->setMaximum(0);
                     ui->labelOrphanStats->setText("");
                 }, Qt::QueuedConnection);
             }
@@ -1270,7 +1278,6 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
                 if (diskCount % 50 == 0) {
                     int dc = diskCount; QString fn = folder;
                     QMetaObject::invokeMethod(this, [this, dc, fn] {
-                        ui->progressBarOrphan->setValue(dc);
                         ui->labelOrphanStats->setText(
                             QString("%1: %2 files checked").arg(fn).arg(dc));
                     }, Qt::QueuedConnection);
@@ -1367,6 +1374,17 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
                     .arg(doneCount)
                     .arg(QString::number(elapsed, 'f', 1))
                     .arg(QFileInfo(absPath).fileName()));
+            }
+
+            // Walk finished — switch the bar back to determinate and full,
+            // now that the real count (diskCount) is actually known.
+            {
+                int dc = diskCount;
+                QMetaObject::invokeMethod(this, [this, dc] {
+                    ui->progressBarOrphan->setMinimum(0);
+                    ui->progressBarOrphan->setMaximum(qMax(dc, 1));
+                    ui->progressBarOrphan->setValue(dc);
+                }, Qt::QueuedConnection);
             }
 
             // ── Per-folder size comparison (the mismatch check) ──────────────
@@ -1621,6 +1639,14 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
     int    filesProcessed = 0, filesCopied = 0, filesGzipped = 0;
 
     // ── Stage 3: Writer thread ────────────────────────────────────────────
+    // Per-file [ROTATE-CHECK]/[WRITE]/[SIZE] logging is throttled to once
+    // every ~2s of wall time on the routine success path — same convention
+    // as the Phase 2 reconcile console log — so a run of hundreds of
+    // thousands of files doesn't flood stdout. Rotations, overwrites, and
+    // failures always log regardless of the throttle, since those are
+    // exactly what a post-hoc analysis needs.
+    QElapsedTimer writerLogTimer; writerLogTimer.start();
+    qint64 lastWriterLogMs = -2000; // force the first file to log
     QThread* writerThread = QThread::create([&]() {
         while (true) {
             WriteItem w;
@@ -1658,17 +1684,41 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
             // Gated on whichever model the user has selected as the hard
             // limit — both models' running totals are kept accurate
             // regardless, so this can be flipped mid-run safely.
+            //
+            // If a file already exists at this path in the current folder
+            // (reprocessed after its done-row was lost, e.g. via orphan
+            // merge), writing it again doesn't grow the folder by the new
+            // file's full size — it replaces what's already counted. The
+            // check and the running-total update below both have to net
+            // out the old contribution first, or the tracked total runs
+            // ahead of real disk usage and the folder seals early.
+            QString prospectiveDestFile = currentFolder + "/" + w.gzName;
+            QFileInfo prospectiveInfo(prospectiveDestFile);
+            bool   prospectiveExists = prospectiveInfo.exists();
+            qint64 prospectiveOldSize = prospectiveExists ? prospectiveInfo.size() : 0;
+            qint64 oldTarContribution  = prospectiveExists ? tarFileBytes(prospectiveOldSize) : 0;
+            qint64 oldLtfsContribution = prospectiveExists
+                ? ltfsFileBytes(prospectiveOldSize, ltfsIndexOverheadBytes) : 0;
+
             qint64 gzSizeForCheck = (qint64)w.gzData.size();
             qint64 nextTarBytes   = tarFileBytes(gzSizeForCheck);
             qint64 nextLtfsBytes  = ltfsFileBytes(gzSizeForCheck, ltfsIndexOverheadBytes);
             HardLimitModel rotateCheckModel = activeHardLimitModel.load();
             qint64 projectedTotal = (rotateCheckModel == HardLimitModel::Ltfs)
-                ? (currentLtfsEst + nextLtfsBytes)
-                : (currentTarEst  + nextTarBytes);
+                ? (currentLtfsEst - oldLtfsContribution + nextLtfsBytes)
+                : (currentTarEst  - oldTarContribution  + nextTarBytes);
             bool wouldExceed = projectedTotal > maxFolderSize;
-            qDebug() << "[ROTATE-CHECK] seq=" << w.seq << "folder=" << currentFolder
+
+            qint64 nowLogMs = writerLogTimer.elapsed();
+            bool logThisFile = wouldExceed || prospectiveExists
+                || (nowLogMs - lastWriterLogMs >= 2000);
+            if (logThisFile) lastWriterLogMs = nowLogMs;
+
+            if (logThisFile) qDebug() << "[ROTATE-CHECK] seq=" << w.seq << "folder=" << currentFolder
                      << "model=" << (rotateCheckModel == HardLimitModel::Ltfs ? "LTFS" : "Tar")
                      << "currentTarEst=" << currentTarEst << "currentLtfsEst=" << currentLtfsEst
+                     << "overwrite=" << prospectiveExists << "oldTar=" << oldTarContribution
+                     << "oldLtfs=" << oldLtfsContribution
                      << "nextTarBytes=" << nextTarBytes << "nextLtfsBytes=" << nextLtfsBytes
                      << "projectedTotal=" << projectedTotal << "maxFolderSize=" << maxFolderSize
                      << "wouldExceed=" << wouldExceed;
@@ -1685,6 +1735,13 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
                 currentTarEst          = 1024;
                 currentLtfsEst         = 0;
                 currentFolderFileCount = 0;
+                // Rotated to a fresh, just-created folder — the overwrite
+                // figures above were computed against the OLD folder and no
+                // longer apply to where this file is actually landing now.
+                prospectiveExists     = false;
+                prospectiveOldSize    = 0;
+                oldTarContribution    = 0;
+                oldLtfsContribution   = 0;
                 qDebug() << "[BACKUP] SEALED folder:" << sealedFolder
                          << "| files=" << sealedFiles
                          << "| raw=" << sealedRaw << "tar=" << sealedTar << "ltfs=" << sealedLtfs
@@ -1728,7 +1785,7 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
             }
             qint64 write_ms = wt.elapsed();
             bool writeOk = closeOk && (bytesWritten == gzSize);
-            qDebug() << "[WRITE] seq=" << w.seq << "dest=" << destFile
+            if (logThisFile || !writeOk) qDebug() << "[WRITE] seq=" << w.seq << "dest=" << destFile
                      << "gzSize=" << gzSize << "bytesWritten=" << bytesWritten
                      << "closeOk=" << closeOk << (closeErr.isEmpty() ? "" : closeErr)
                      << "writeOk=" << writeOk << write_ms << "ms";
@@ -1748,17 +1805,25 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
 
             // Update tracking — the gzip size was already known before the
             // write; a confirmed write+close is success, full stop.
-            currentRawBytes += gzSize;
-            qint64 tarAdd  = tarFileBytes(gzSize);
-            qint64 ltfsAdd = ltfsFileBytes(gzSize, ltfsIndexOverheadBytes);
+            //
+            // Net out whatever this write replaced (prospectiveOldSize/
+            // oldTarContribution/oldLtfsContribution, computed above against
+            // the same destFile before the rotate check) instead of adding
+            // the new size on top of a total that may already include the
+            // old copy of this exact file.
+            qint64 tarAdd  = tarFileBytes(gzSize)  - oldTarContribution;
+            qint64 ltfsAdd = ltfsFileBytes(gzSize, ltfsIndexOverheadBytes) - oldLtfsContribution;
+            currentRawBytes += gzSize - prospectiveOldSize;
             currentTarEst   += tarAdd;
             currentLtfsEst  += ltfsAdd;
             ++currentFolderFileCount;
             totalBytesRead     += w.srcSize;
             totalBytesWritten  += gzSize;
             if (w.alreadyGz) ++filesCopied; else ++filesGzipped;
-            qDebug() << "[SIZE] seq=" << w.seq << "folder=" << currentFolder
-                     << "+gz=" << gzSize << "tar+=" << tarAdd << "ltfs+=" << ltfsAdd
+            if (logThisFile) qDebug() << "[SIZE] seq=" << w.seq << "folder=" << currentFolder
+                     << "+gz=" << gzSize << "overwrote=" << prospectiveExists
+                     << "oldSize=" << prospectiveOldSize
+                     << "tar+=" << tarAdd << "ltfs+=" << ltfsAdd
                      << "-> tarTotal=" << currentTarEst << "ltfsTotal=" << currentLtfsEst
                      << "filesThisFolder=" << currentFolderFileCount;
 
@@ -1777,7 +1842,7 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
             doneRow.write_ms      = write_ms;
             m_db->insertDone(doneRow);
             m_db->flushTxn();
-            qDebug() << "[DONE] seq=" << w.seq << "src=" << w.rel << "dst=" << dstRelPath
+            if (logThisFile) qDebug() << "[DONE] seq=" << w.seq << "src=" << w.rel << "dst=" << dstRelPath
                      << "bytes=" << w.srcSize << "gz_bytes=" << gzSize << "committed to done table";
 
             statWriteMs.fetch_add(write_ms);
