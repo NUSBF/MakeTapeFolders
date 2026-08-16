@@ -1011,13 +1011,27 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
 
     currentBackupPhase.store(kBackupPhaseVerify);
     qDebug() << "[BACKUP] ── Phase 1: validate done table ──────────────────────────";
+    // progressBarVerify/labelVerifyStats are only ever written inside the
+    // per-item verify loop below, which runs zero times when there's
+    // nothing to verify (folderDoneCount == 0, e.g. right after a done-table
+    // reset) — leaving whatever was on screen from a previous run
+    // displayed unchanged, making it look like Phase 1 never ran while
+    // Phase 2 starts moving right after it. Reset explicitly so Phase 1
+    // shows a real, current, empty state regardless of how much work it
+    // ends up finding.
+    QMetaObject::invokeMethod(this, [this] {
+        ui->progressBarVerify->setMinimum(0);
+        ui->progressBarVerify->setMaximum(1);
+        ui->progressBarVerify->setValue(0);
+        ui->labelVerifyStats->setText("");
+    }, Qt::QueuedConnection);
     // Only validate files in the current (last) tape folder — completed tapes are not re-checked.
     QStringList existingFoldersP1 = QDir(destBase).entryList(
         QStringList() << (prefix + "_???"), QDir::Dirs, QDir::Name);
     QString currentFolderName = existingFoldersP1.isEmpty() ? QString() : existingFoldersP1.last();
     qDebug() << "[BACKUP] Phase 1: current folder for validation:" << currentFolderName;
 
-    int doneTotal = 0;
+    int folderDoneCount = 0;
     {
         if (currentFolderName.isEmpty()) {
             qDebug() << "[BACKUP] Phase 1: no existing folders — nothing to validate";
@@ -1027,19 +1041,19 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
         QElapsedTimer stepTimer; stepTimer.start();
         {
             QueryHeartbeat hb(QString("Phase 1: countDoneInFolder(%1)").arg(currentFolderName));
-            doneTotal = (int)m_db->countDoneInFolder(sourceRoot, folderPattern);
+            folderDoneCount = (int)m_db->countDoneInFolder(sourceRoot, folderPattern);
         }
         qDebug() << "[BACKUP] Phase 1: countDoneInFolder took" << stepTimer.elapsed() << "ms —"
-                 << doneTotal << "rows";
+                 << folderDoneCount << "rows";
 
-        setStatus(QString("Verifying %1 files in current tape folder %2…").arg(doneTotal).arg(currentFolderName));
+        setStatus(QString("Verifying %1 files in current tape folder %2…").arg(folderDoneCount).arg(currentFolderName));
 
         // Load all rows first (SQLite access must be single-threaded)
         struct VerifyItem { QString src, dstFull; qint64 origSize, gzBytes; bool wasAlreadyGz; };
         std::vector<VerifyItem> verifyItems;
-        verifyItems.reserve(doneTotal);
+        verifyItems.reserve(folderDoneCount);
         {
-            qDebug() << "[BACKUP] Phase 1: loading" << doneTotal << "done rows for verification...";
+            qDebug() << "[BACKUP] Phase 1: loading" << folderDoneCount << "done rows for verification...";
             stepTimer.restart();
             QVector<DoneVerifyItem> rows;
             {
@@ -1076,7 +1090,7 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
         for (auto item : verifyItems) {   // capture by value — loop var changes each iteration
             if (stopRequested.load()) break;
             verifyPool.start([this, item, &checked, &bytesChecked, &lastConsoleLogMs,
-                              &removeMutex, &toRemove, &verifyTimer, doneTotal] {
+                              &removeMutex, &toRemove, &verifyTimer, folderDoneCount] {
                 // Tasks already queued (not yet started) when stop is
                 // requested skip their blocking file work entirely instead
                 // of running to completion — bounds how long
@@ -1099,25 +1113,25 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
                 qint64 prevLogMs = lastConsoleLogMs.load();
                 bool timeToLog = (nowMs - prevLogMs) >= 2000
                     && lastConsoleLogMs.compare_exchange_strong(prevLogMs, nowMs);
-                if (timeToLog || c == doneTotal) {
+                if (timeToLog || c == folderDoneCount) {
                     int bad; { QMutexLocker lk(&removeMutex); bad = toRemove.size(); }
-                    qDebug() << "[VERIFY]" << c << "/" << doneTotal
+                    qDebug() << "[VERIFY]" << c << "/" << folderDoneCount
                              << "| bad:" << bad
                              << "| elapsed:" << QString::number(nowMs / 1000.0, 'f', 1) << "s";
                 }
-                if (c % 50 == 0 || c == doneTotal) {
+                if (c % 50 == 0 || c == folderDoneCount) {
                     double el = verifyTimer.elapsed() / 1000.0;
                     int bad; { QMutexLocker lk(&removeMutex); bad = toRemove.size(); }
                     qint64 bc = bytesChecked.load();
-                    QMetaObject::invokeMethod(this, [this, c, doneTotal, bad, el, bc] {
-                        ui->progressBarVerify->setMaximum(doneTotal);
+                    QMetaObject::invokeMethod(this, [this, c, folderDoneCount, bad, el, bc] {
+                        ui->progressBarVerify->setMaximum(folderDoneCount);
                         ui->progressBarVerify->setValue(c);
                         ui->labelVerifyStats->setText(
                             QString("%1 / %2 checked  ·  %3 bad  ·  %4 s")
-                                .arg(c).arg(doneTotal).arg(bad).arg(QString::number(el,'f',1)));
+                                .arg(c).arg(folderDoneCount).arg(bad).arg(QString::number(el,'f',1)));
                         ui->labelBackupStatus->setText(
                             QString("Verifying %1 / %2  (%3)  —  %4 bad  —  %5 s")
-                                .arg(c).arg(doneTotal)
+                                .arg(c).arg(folderDoneCount)
                                 .arg(QLocale().formattedDataSize(bc, 2, QLocale::DataSizeSIFormat))
                                 .arg(bad).arg(QString::number(el, 'f', 1)));
                     }, Qt::QueuedConnection);
@@ -1389,14 +1403,29 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
                     .arg(QFileInfo(absPath).fileName()));
             }
 
-            // Walk finished — switch the bar back to determinate and full,
-            // now that the real count (diskCount) is actually known.
+            // Walk finished. On a genuine finish, diskCount is the folder's
+            // real total, so a full determinate bar is accurate. If
+            // stopRequested fired mid-walk instead, diskCount is only how
+            // far the walk got before being cut off, not the folder's real
+            // total (126,312 files vs. the 528 actually walked, e.g.) —
+            // there is no true denominator to show a meaningful fraction
+            // against, so showing any percentage here (full or partial)
+            // would misrepresent a truncated scan as measured progress.
+            // Leave it empty/indeterminate instead; labelOrphanStats
+            // already reports the real partial counts as plain numbers.
             {
-                int dc = diskCount;
-                QMetaObject::invokeMethod(this, [this, dc] {
-                    ui->progressBarOrphan->setMinimum(0);
-                    ui->progressBarOrphan->setMaximum(qMax(dc, 1));
-                    ui->progressBarOrphan->setValue(dc);
+                int  dc      = diskCount;
+                bool stopped = stopRequested.load();
+                QMetaObject::invokeMethod(this, [this, dc, stopped] {
+                    if (stopped) {
+                        ui->progressBarOrphan->setMinimum(0);
+                        ui->progressBarOrphan->setMaximum(1);
+                        ui->progressBarOrphan->setValue(0);
+                    } else {
+                        ui->progressBarOrphan->setMinimum(0);
+                        ui->progressBarOrphan->setMaximum(qMax(dc, 1));
+                        ui->progressBarOrphan->setValue(dc);
+                    }
                 }, Qt::QueuedConnection);
             }
 
@@ -1429,9 +1458,15 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
 
         m_db->commitTxn();
 
-        doneTotal += totalOrphansAdded;
+        folderDoneCount += totalOrphansAdded;
         double totalS = orphanTimer.elapsed() / 1000.0;
-        qDebug() << "[RECONCILE] complete:"
+        // stopRequested here means the walk above was cut short — whatever
+        // was found is real, but it's a partial pass over the folder, not a
+        // completed one, and the wording needs to say so instead of
+        // claiming "complete" for a scan that covered a fraction of the
+        // folder's actual file count.
+        bool reconcileStopped = stopRequested.load();
+        qDebug() << (reconcileStopped ? "[RECONCILE] stopped early:" : "[RECONCILE] complete:")
                  << "added=" << totalOrphansAdded
                  << "(" << QLocale().formattedDataSize(totalBytesAdded) << ")"
                  << "deleted=" << totalOrphansInvalid
@@ -1439,7 +1474,8 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
                  << "took" << QString::number(totalS, 'f', 1) << "s";
 
         setStatus(QString(
-            "Folder reconcile: %1 added to done (%2)  |  %3 deleted (corrupt)  |  %4 no-src  |  %5 s")
+            "Folder reconcile %1: %2 added to done (%3)  |  %4 deleted (corrupt)  |  %5 no-src  |  %6 s")
+            .arg(reconcileStopped ? "(stopped early — partial)" : "complete")
             .arg(totalOrphansAdded)
             .arg(QLocale().formattedDataSize(totalBytesAdded, 2, QLocale::DataSizeSIFormat))
             .arg(totalOrphansInvalid)
@@ -1545,7 +1581,7 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
     }
     {
         QString statsInit = QString("Previously done: %1 files  |  Remaining: %2  |  Current folder: %3  (%4 filled)")
-            .arg(QLocale().toString((qint64)doneTotal))
+            .arg(QLocale().toString((qint64)folderDoneCount))
             .arg(QLocale().toString(totalRemaining))
             .arg(QDir(currentFolder).dirName())
             .arg(QLocale().formattedDataSize(activeBytes, 2, QLocale::DataSizeSIFormat));
@@ -2010,7 +2046,7 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
             ui->labelStats->setText(
                 QString("done: %1  |  %2 f/s  |  %3 MB/s  |  ratio: %4x"
                         "  |  ETA: %5 min  |  RAM: %6  |  failed: %7  |  folder: %8")
-                    .arg(QLocale().toString((qint64)(doneTotal + vv)))
+                    .arg(QLocale().toString((qint64)(folderDoneCount + vv)))
                     .arg(QString::number(fps, 'f', 2))
                     .arg(QString::number(mbps, 'f', 1))
                     .arg(QString::number(ratioX, 'f', 2))
@@ -2357,7 +2393,7 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
     // fields (ETA, RAM in flight) that are meaningless once nothing is
     // running. Give it one last, explicitly final value instead.
     {
-        qint64 finalDone = (qint64)(doneTotal + filesProcessed);
+        qint64 finalDone = (qint64)(folderDoneCount + filesProcessed);
         QString finalFolder = QDir(currentFolder).dirName();
         QString finalState = stopRequested.load() ? "stopped" : "completed";
         QMetaObject::invokeMethod(this, [this, finalDone, finalFolder, finalState] {
