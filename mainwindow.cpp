@@ -1273,19 +1273,36 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
             int    folderOrphNoSrc   = 0;
             qint64 lastConsoleLogMs  = 0; // time-based console progress, see below
 
+            // doneCount (the done-table row count going in) is not the real
+            // file count on disk and can be far off it (e.g. 0 right after a
+            // reset) — using it as the bar's maximum previously left the bar
+            // clamped near-empty (or falsely-indeterminate) for the whole
+            // walk even as labelOrphanStats reported real, accurate
+            // progress. A cheap pre-pass (just iterating names, no per-file
+            // gzip/DB work) gets the real total up front so the bar can show
+            // genuine, live percentage progress instead of a placeholder.
+            qint64 totalFilesOnDisk = 0;
             {
-                // The real file count on disk isn't known until the walk
-                // below finishes — doneCount (the done-table row count going
-                // in) is not that number and can be far off it (e.g. 0 right
-                // after a reset), so using it as the bar's maximum previously
-                // left the bar clamped near-empty for the whole walk even as
-                // labelOrphanStats reported real, accurate progress. Busy/
-                // indeterminate mode (min=max=0) is honest about not knowing
-                // the total; set to a real determinate 100% once the walk
-                // completes, below.
-                QMetaObject::invokeMethod(this, [this] {
+                QElapsedTimer countTimer; countTimer.start();
+                QDirIterator countIt(folderPath,
+                                QDir::Files | QDir::NoSymLinks | QDir::NoDotAndDotDot,
+                                QDirIterator::Subdirectories);
+                while (countIt.hasNext()) {
+                    if (stopRequested.load()) break;
+                    countIt.next();
+                    ++totalFilesOnDisk;
+                }
+                qDebug() << "[BACKUP] Phase 2:" << folder << "pre-count:" << totalFilesOnDisk
+                         << "files, took" << countTimer.elapsed() << "ms";
+            }
+            if (stopRequested.load()) break;
+
+            {
+                int barMax = (int)qMin(qMax(totalFilesOnDisk, (qint64)1), (qint64)INT_MAX);
+                QMetaObject::invokeMethod(this, [this, barMax] {
                     ui->progressBarOrphan->setMinimum(0);
-                    ui->progressBarOrphan->setMaximum(0);
+                    ui->progressBarOrphan->setMaximum(barMax);
+                    ui->progressBarOrphan->setValue(0);
                     ui->labelOrphanStats->setText("");
                 }, Qt::QueuedConnection);
             }
@@ -1322,6 +1339,7 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
                 if (diskCount % 50 == 0) {
                     int dc = diskCount; QString fn = folder;
                     QMetaObject::invokeMethod(this, [this, dc, fn] {
+                        ui->progressBarOrphan->setValue(dc);
                         ui->labelOrphanStats->setText(
                             QString("%1: %2 files checked").arg(fn).arg(dc));
                     }, Qt::QueuedConnection);
@@ -1420,29 +1438,15 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
                     .arg(QFileInfo(absPath).fileName()));
             }
 
-            // Walk finished. On a genuine finish, diskCount is the folder's
-            // real total, so a full determinate bar is accurate. If
-            // stopRequested fired mid-walk instead, diskCount is only how
-            // far the walk got before being cut off, not the folder's real
-            // total (126,312 files vs. the 528 actually walked, e.g.) —
-            // there is no true denominator to show a meaningful fraction
-            // against, so showing any percentage here (full or partial)
-            // would misrepresent a truncated scan as measured progress.
-            // Leave it empty/indeterminate instead; labelOrphanStats
-            // already reports the real partial counts as plain numbers.
+            // Walk finished (naturally or via stop). The bar's maximum was
+            // already set to the real pre-counted total above and hasn't
+            // changed, so diskCount here is a genuine numerator against a
+            // genuine denominator either way — a stop just leaves it short
+            // of full, accurately, instead of needing special-case handling.
             {
-                int  dc      = diskCount;
-                bool stopped = stopRequested.load();
-                QMetaObject::invokeMethod(this, [this, dc, stopped] {
-                    if (stopped) {
-                        ui->progressBarOrphan->setMinimum(0);
-                        ui->progressBarOrphan->setMaximum(1);
-                        ui->progressBarOrphan->setValue(0);
-                    } else {
-                        ui->progressBarOrphan->setMinimum(0);
-                        ui->progressBarOrphan->setMaximum(qMax(dc, 1));
-                        ui->progressBarOrphan->setValue(dc);
-                    }
+                int dc = diskCount;
+                QMetaObject::invokeMethod(this, [this, dc] {
+                    ui->progressBarOrphan->setValue(dc);
                 }, Qt::QueuedConnection);
             }
 
