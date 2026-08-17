@@ -1,5 +1,6 @@
 #include "DbBackend.h"
 
+#include <QDateTime>
 #include <QDebug>
 #include <QDir>
 #include <QElapsedTimer>
@@ -177,6 +178,16 @@ void DbBackend::createSchemaSqlite(QSqlDatabase& db)
         " size INTEGER, ext TEXT, folder TEXT, mtime INTEGER, scanned_at INTEGER,"
         " PRIMARY KEY (source_root, src_hash))");
     q.exec("CREATE INDEX IF NOT EXISTS idx_files_folder ON files(source_root, folder)");
+    // Snapshot of files rows taken right before a re-scan deletes and
+    // replaces them — no primary key, since the same (source_root,
+    // src_hash) legitimately reappears across multiple archived
+    // generations over time.
+    q.exec(
+        "CREATE TABLE IF NOT EXISTS files_archive ("
+        " source_root TEXT NOT NULL, src TEXT NOT NULL, src_hash BLOB NOT NULL,"
+        " size INTEGER, ext TEXT, folder TEXT, mtime INTEGER, scanned_at INTEGER,"
+        " archived_at INTEGER NOT NULL)");
+    q.exec("CREATE INDEX IF NOT EXISTS idx_files_archive_source ON files_archive(source_root, archived_at)");
     q.exec(
         "CREATE TABLE IF NOT EXISTS done ("
         " source_root TEXT NOT NULL, src TEXT NOT NULL, src_hash BLOB NOT NULL,"
@@ -202,6 +213,16 @@ void DbBackend::createSchemaMariaDb(QSqlDatabase& db)
         " read_ms BIGINT, compress_ms BIGINT, write_ms BIGINT,"
         " PRIMARY KEY (source_root, src_hash))"
         " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+    // Snapshot of files rows taken right before a re-scan deletes and
+    // replaces them — no primary key, since the same (source_root,
+    // src_hash) legitimately reappears across multiple archived
+    // generations over time.
+    q.exec(
+        "CREATE TABLE IF NOT EXISTS files_archive ("
+        " source_root VARCHAR(128) NOT NULL, src TEXT NOT NULL, src_hash BINARY(32) NOT NULL,"
+        " size BIGINT, ext VARCHAR(32), folder VARCHAR(512), mtime BIGINT, scanned_at BIGINT,"
+        " archived_at BIGINT NOT NULL)"
+        " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
 
     auto indexExists = [&](const QString& table, const QString& index) {
         QSqlQuery chk(db);
@@ -215,6 +236,8 @@ void DbBackend::createSchemaMariaDb(QSqlDatabase& db)
         q.exec("CREATE INDEX idx_files_folder ON files(source_root, folder(191))");
     if (!indexExists("done", "idx_done_dst"))
         q.exec("CREATE INDEX idx_done_dst ON done(dst(191))");
+    if (!indexExists("files_archive", "idx_files_archive_source"))
+        q.exec("CREATE INDEX idx_files_archive_source ON files_archive(source_root, archived_at)");
 }
 
 bool DbBackend::migrateSqliteHashKeyIfNeeded(QSqlDatabase& db, QString* errorOut)
@@ -475,6 +498,33 @@ SourceStats DbBackend::statsForSource(const QString& sourceRoot)
     return s;
 }
 
+void DbBackend::archiveScanForSubfolder(const QString& sourceRoot, const QString& relLikePattern)
+{
+    QSqlDatabase db = connection();
+    QSqlQuery q(db);
+    q.prepare("INSERT INTO files_archive"
+              "(source_root,src,src_hash,size,ext,folder,mtime,scanned_at,archived_at)"
+              " SELECT source_root,src,src_hash,size,ext,folder,mtime,scanned_at,?"
+              " FROM files WHERE source_root = ? AND src LIKE ?");
+    q.addBindValue(QDateTime::currentSecsSinceEpoch());
+    q.addBindValue(sourceRoot);
+    q.addBindValue(relLikePattern);
+    q.exec();
+}
+
+void DbBackend::archiveScanForSource(const QString& sourceRoot)
+{
+    QSqlDatabase db = connection();
+    QSqlQuery q(db);
+    q.prepare("INSERT INTO files_archive"
+              "(source_root,src,src_hash,size,ext,folder,mtime,scanned_at,archived_at)"
+              " SELECT source_root,src,src_hash,size,ext,folder,mtime,scanned_at,?"
+              " FROM files WHERE source_root = ?");
+    q.addBindValue(QDateTime::currentSecsSinceEpoch());
+    q.addBindValue(sourceRoot);
+    q.exec();
+}
+
 void DbBackend::deleteScanForSubfolder(const QString& sourceRoot, const QString& relLikePattern)
 {
     QSqlDatabase db = connection();
@@ -636,13 +686,37 @@ void DbBackend::insertOrphanDone(const QString& sourceRoot, const QString& src, 
     q->exec();
 }
 
+// A source directory can legitimately contain both "X" and "X.gz" as two
+// separate, real files (confirmed: 105,776 such pairs out of 1,290,623 files
+// on one real source root). Both compress/copy to the identical destination
+// path ("X.gz"), so backing up both is a collision — the second write
+// silently overwrites the first, both get their own `done` row (they're
+// different src_hash), and the done-table's row count for a folder ends up
+// exceeding its real distinct file count. The gz sibling is already
+// compressed and needs no work; the plain sibling is the redundant one, so
+// it's excluded here whenever its own ".gz"-suffixed sibling also exists as
+// a source file. UNHEX(SHA2(...)) reproduces computeSrcHash() exactly
+// (verified against real stored hashes) so this is a src_hash-indexed
+// lookup, not a full scan.
+static const char* kExcludeGzShadowedSql =
+    "AND NOT ("
+    "  f.src NOT LIKE '%.gz'"
+    "  AND EXISTS ("
+    "    SELECT 1 FROM files g"
+    "    WHERE g.source_root = f.source_root"
+    "      AND g.src_hash = UNHEX(SHA2(CONCAT(f.source_root, CHAR(31), CONCAT(f.src, '.gz')), 256))"
+    "  )"
+    ") ";
+
 qint64 DbBackend::countRemaining(const QString& sourceRoot)
 {
     QSqlDatabase db = connection();
     QSqlQuery q(db);
-    q.prepare("SELECT COUNT(*) FROM files f "
+    q.prepare(QString(
+              "SELECT COUNT(*) FROM files f "
               "LEFT JOIN done d ON d.source_root = f.source_root AND d.src_hash = f.src_hash "
-              "WHERE f.source_root = ? AND d.src_hash IS NULL");
+              "WHERE f.source_root = ? AND d.src_hash IS NULL %1")
+              .arg(kExcludeGzShadowedSql));
     q.addBindValue(sourceRoot);
     if (q.exec() && q.next()) return q.value(0).toLongLong();
     return 0;
@@ -652,9 +726,11 @@ qint64 DbBackend::sumRemainingBytes(const QString& sourceRoot)
 {
     QSqlDatabase db = connection();
     QSqlQuery q(db);
-    q.prepare("SELECT SUM(f.size) FROM files f "
+    q.prepare(QString(
+              "SELECT SUM(f.size) FROM files f "
               "LEFT JOIN done d ON d.source_root = f.source_root AND d.src_hash = f.src_hash "
-              "WHERE f.source_root = ? AND d.src_hash IS NULL");
+              "WHERE f.source_root = ? AND d.src_hash IS NULL %1")
+              .arg(kExcludeGzShadowedSql));
     q.addBindValue(sourceRoot);
     if (q.exec() && q.next()) return q.value(0).toLongLong();
     return 0;
@@ -666,12 +742,13 @@ DbBackend::RemainingCursor DbBackend::openRemainingCursor(const QString& sourceR
     RemainingCursor cur;
     cur.m_query = QSqlQuery(db);
     cur.m_query.setForwardOnly(true);
-    cur.m_query.prepare(
+    cur.m_query.prepare(QString(
         "SELECT f.src, f.size "
         "FROM files f "
         "LEFT JOIN done d ON d.source_root = f.source_root AND d.src_hash = f.src_hash "
-        "WHERE f.source_root = ? AND d.src_hash IS NULL "
-        "ORDER BY f.folder, f.src");
+        "WHERE f.source_root = ? AND d.src_hash IS NULL %1"
+        "ORDER BY f.folder, f.src")
+        .arg(kExcludeGzShadowedSql));
     cur.m_query.addBindValue(sourceRoot);
     cur.m_query.exec();
     return cur;

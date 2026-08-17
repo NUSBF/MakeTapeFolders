@@ -58,6 +58,8 @@ public:
     // ---- Tab 1: source index ------------------------------------------------
     QStringList sourceRoots();
     SourceStats statsForSource(const QString& sourceRoot);
+    void archiveScanForSubfolder(const QString& sourceRoot, const QString& relLikePattern);
+    void archiveScanForSource(const QString& sourceRoot);
     void deleteScanForSubfolder(const QString& sourceRoot, const QString& relLikePattern);
     void deleteScanForSource(const QString& sourceRoot);
     void insertScannedFile(const FileRow& row);   // lazily prepares+caches per thread

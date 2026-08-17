@@ -661,13 +661,17 @@ void MainWindow::runScan(const QString& scanRoot, const QString& sourceRoot)
     setProgressVal(0);
     setStatus(QString("Phase 2/2 — indexing %1 files…").arg(totalCount));
 
-    // ── Delete stale entries for the scanned subtree ───────────────────────
+    // ── Archive the current scan, then delete stale entries for the
+    // scanned subtree — archive always runs first so there's never a
+    // window where the old rows are gone but no snapshot of them exists.
     {
         if (isPartial) {
             QString relPrefix = scanRoot.mid(sourceRoot.length());
             if (relPrefix.startsWith('/')) relPrefix = relPrefix.mid(1);
+            m_db->archiveScanForSubfolder(sourceRoot, relPrefix + "/%");
             m_db->deleteScanForSubfolder(sourceRoot, relPrefix + "/%");
         } else {
+            m_db->archiveScanForSource(sourceRoot);
             m_db->deleteScanForSource(sourceRoot);
         }
     }
