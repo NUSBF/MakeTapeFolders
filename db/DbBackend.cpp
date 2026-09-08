@@ -97,6 +97,29 @@ QSqlDatabase DbBackend::connection()
         QString err;
         if (!openConnection(db, &err))
             qWarning() << "[DB] failed to open connection" << name << ":" << err;
+        return db;
+    }
+    // isOpen() only reflects client-side state — it stays true even after
+    // the server has dropped an idle connection (MariaDB's wait_timeout,
+    // a network blip, a restart). Every caller in this file does
+    // `if (q.exec() && q.next()) return X; return 0/false/{};` — a query
+    // against a connection that's dead on the server side fails exec()
+    // exactly like "genuinely zero rows", so a stale connection here
+    // silently turns into wrong answers everywhere downstream (e.g.
+    // countIndexedFiles() returning 0 and reporting "no files indexed"
+    // for a source that was scanned minutes earlier). Verify liveness with
+    // a trivial query and reconnect once before handing it out, instead of
+    // deferring that discovery to whichever caller happens to query next.
+    {
+        QSqlQuery ping(db);
+        if (!ping.exec("SELECT 1")) {
+            qWarning() << "[DB] connection" << name << "dead, reconnecting:"
+                       << db.lastError().text();
+            db.close();
+            QString err;
+            if (!openConnection(db, &err))
+                qWarning() << "[DB] reconnect failed for" << name << ":" << err;
+        }
     }
     return db;
 }
