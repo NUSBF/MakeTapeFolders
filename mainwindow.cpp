@@ -1744,11 +1744,14 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
                 filesBeingWritten.fetch_add(-1);
                 if (!w.alreadyReported) {
                     // Read failures already called addFailed() and never added
-                    // to ramInFlight — only compress failures need this here.
+                    // to ramInFlight. Compress failures also no longer need a
+                    // release here — the compress task itself already settled
+                    // ramInFlight down to 0 for this file the moment it knew
+                    // it had failed (see the compress lambda), instead of
+                    // leaving a stale 2x-srcSize reservation sitting around
+                    // for however long this item then waits in the write map.
                     addFailed(w.rel, w.srcSize, w.alreadyGz,
                               w.failReason.isEmpty() ? "compression failed" : w.failReason);
-                    ramInFlight.fetch_add(-w.srcSize);
-                    { QMutexLocker lk(&writeMutex); ramCV.wakeAll(); }
                 }
                 ++nextWriteSeq;
                 continue;
@@ -1870,7 +1873,10 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
                     .arg(closeErr.isEmpty() ? "none" : closeErr);
                 QFile::remove(destFile);
                 addFailed(w.rel, w.srcSize, w.alreadyGz, "write failed", destEvidence);
-                ramInFlight.fetch_add(-w.srcSize);
+                // gzSize, not w.srcSize — gzData's size is what's actually
+                // been reserved in ramInFlight since compression settled it
+                // down (see the compress lambda).
+                ramInFlight.fetch_add(-gzSize);
                 { QMutexLocker lk(&writeMutex); ramCV.wakeAll(); }
                 ++nextWriteSeq;
                 continue;
@@ -1925,8 +1931,9 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
             bytesWrittenAtomic.store(totalBytesWritten);
             bytesReadAtomic.store(totalBytesRead);
 
-            // Release RAM budget
-            ramInFlight.fetch_add(-w.srcSize);
+            // Release RAM budget — gzSize (what's actually reserved since
+            // compression settled it down), not w.srcSize.
+            ramInFlight.fetch_add(-gzSize);
             { QMutexLocker lk(&writeMutex); ramCV.wakeAll(); }
 
             // Status: what was just written
@@ -1963,11 +1970,15 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
             ++nextWriteSeq;
         }
 
-        // If force-killed, free RAM for any items still in writeMap
+        // If force-killed, free RAM for any items still in writeMap. A
+        // failed item's share was already released to 0 by the compress
+        // task itself; a successful one's reservation is gzData's real
+        // size, not srcSize (see the compress lambda) — item.srcSize would
+        // double-release failures and over-release successes here.
         if (forceKillWriter.load()) {
             QMutexLocker lk(&writeMutex);
             for (auto& [seq, item] : writeMap) {
-                ramInFlight.fetch_add(-item.srcSize);
+                if (item.ok) ramInFlight.fetch_add(-(qint64)item.gzData.size());
                 filesInWriteMap.fetch_add(-1);
             }
             writeMap.clear();
@@ -2136,7 +2147,8 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
         readPool.start([=, &compressPool, &writeMutex, &writeCV, &writeMap,
                         &writeMapDepthMax, &statReadMs, &statCompressMs,
                         &filesInCompressPipeline, &filesCompressedAtomic,
-                        &filesBeingRead, &ramInFlight, &filesSkippedStop]() mutable {
+                        &filesBeingRead, &ramInFlight, &filesSkippedStop,
+                        &ramCV]() mutable {
             // A read failure still has to occupy its seq slot in writeMap —
             // otherwise the writer thread waits forever for a seq that will
             // never arrive, while later (successful) files pile up unwritten.
@@ -2229,15 +2241,27 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
             qDebug() << "[READ] seq=" << capturedSeq << "done in" << rmx << "ms"
                      << "| avg" << QString::number(doneAvgMBs, 'f', 1) << "MB/s";
 
-            // File fully in RAM — leave Read stage, enter Compress stage
-            ramInFlight.fetch_add(srcSize);
+            // File fully in RAM — leave Read stage, enter Compress stage.
+            // Budget 2x srcSize here, not 1x: during compression, both the
+            // read buffer (inputData, srcSize) and the output buffer being
+            // built (out) are alive at once, and for poorly-compressible
+            // data (e.g. EER camera frames) out can approach srcSize itself
+            // — so actual peak usage during this window is up to ~2x what a
+            // 1x budget accounts for. With dozens of concurrent compress
+            // threads on a many-core box, that gap is real GB, uncounted,
+            // and was the direct cause of an OOM kill (~70GB RSS against a
+            // ~64GB intended cap) on a 96-core run dominated by ~330MB EER
+            // files. Settled back down to the real gzData size once
+            // compression finishes, below.
+            ramInFlight.fetch_add(2 * srcSize);
             filesBeingRead.fetch_add(-1);
             filesInCompressPipeline.fetch_add(1);
 
             // Submit compression task (captures per-file state by value, shared structures by ref)
             compressPool.start([=, &compressPool, &writeMutex, &writeCV, &writeMap,
                                 &writeMapDepthMax, &statReadMs, &statCompressMs,
-                                &filesInCompressPipeline, &filesCompressedAtomic]() mutable {
+                                &filesInCompressPipeline, &filesCompressedAtomic,
+                                &ramInFlight, &ramCV]() mutable {
                 WriteItem w;
                 w.seq        = capturedSeq;
                 w.rel        = rel;
@@ -2285,6 +2309,19 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
                     }
                 }
                 w.compress_ms = ct.elapsed();
+
+                // inputData is freed when this lambda returns (it was
+                // captured by value, local to this task) — only w.gzData
+                // survives into the write queue. Settle the budget down
+                // from the worst-case 2x reserved above to exactly what's
+                // actually still alive: gzData's real size on success,
+                // nothing on failure (nothing of this file's data persists).
+                {
+                    qint64 keep = w.ok ? (qint64)w.gzData.size() : 0;
+                    ramInFlight.fetch_add(keep - 2 * srcSize);
+                    QMutexLocker lk(&writeMutex);
+                    ramCV.wakeAll();
+                }
 
                 double rspeed = rmx > 0 ? (srcSize / 1e6) / (rmx / 1000.0) : 0;
                 double cspeed = w.compress_ms > 0 ? (srcSize / 1e6) / (w.compress_ms / 1000.0) : 0;
