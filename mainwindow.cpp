@@ -1631,14 +1631,33 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
     QThreadPool readPool;
     readPool.setMaxThreadCount(6);
 
-    qint64 ramLimit = 64LL * 1024 * 1024 * 1024;
+    // Confirmed on a real run: RAM_inflight (logged in binary GiB) was being
+    // eyeballed against ramLimit (logged in decimal GB) as if directly
+    // comparable — they're not the same unit. Converted properly, the
+    // tracked in-flight total was *already exceeding* the limit at several
+    // points in that run (e.g. 66.15 GiB = 71.04 GB against a 68.72 GB
+    // limit), not safely under it as the mismatched units made it look.
+    // The gate that's meant to enforce this (ramInFlight.load() + srcSize >
+    // ramLimit) only checks at admission time, before a file's actual read
+    // completes — up to readPool's 6 threads can be admitted concurrently
+    // against a ramInFlight value none of them have posted to yet, so the
+    // ledger can jump past the limit in one step once they land. A thin
+    // flat 2GB margin on top of a one-time startup snapshot of
+    // MemAvailable doesn't survive that slop, especially on a shared,
+    // multi-tenant machine where other processes' usage moves independently
+    // for the entire (multi-hour) duration of a run. Lower the ceiling and
+    // widen the margin substantially so real headroom exists against both
+    // the gate's own imprecision and other processes on the box — this
+    // bounds the consequence of the timing gap instead of requiring it to
+    // be closed perfectly.
+    qint64 ramLimit = 32LL * 1024 * 1024 * 1024;
     {
         QFile mi("/proc/meminfo");
         if (mi.open(QIODevice::ReadOnly)) {
             for (QString line; !(line = mi.readLine()).isEmpty(); ) {
                 if (line.startsWith("MemAvailable:")) {
                     qint64 kb = line.split(QRegularExpression("\\s+")).at(1).toLongLong();
-                    qint64 safe = kb * 1024 - 2LL*1024*1024*1024;
+                    qint64 safe = kb * 1024 - 16LL*1024*1024*1024;
                     ramLimit = qMin(ramLimit, qMax(512LL*1024*1024, safe));
                     break;
                 }
@@ -1646,7 +1665,8 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
         }
     }
     qDebug() << "[BACKUP] threads:" << nThreads
-             << "ramLimit:" << QLocale().formattedDataSize(ramLimit,2,QLocale::DataSizeSIFormat);
+             << "ramLimit:" << QLocale().formattedDataSize(ramLimit, 2, QLocale::DataSizeIecFormat)
+             << "(" << QLocale().formattedDataSize(ramLimit, 2, QLocale::DataSizeSIFormat) << ")";
 
     // ── Shared pipeline data ──────────────────────────────────────────────
     struct WriteItem {
@@ -1961,7 +1981,15 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
                          << "| read_avg="     << QString::number(avgRead/1000,'f',2)     << "s"
                          << "| compress_avg=" << QString::number(avgCompress/1000,'f',2) << "s"
                          << "| write_avg="    << QString::number(avgWrite/1000,'f',2)    << "s"
-                         << "| RAM_inflight=" << QLocale().formattedDataSize(ramInFlight.load())
+                         // SI (decimal), matching ramLimit's unit exactly —
+                         // these two numbers get eyeballed against each
+                         // other, and a binary-vs-decimal mismatch here
+                         // previously hid a real overshoot (66.15 GiB read
+                         // as if comparable to "68.72 GB" when it was
+                         // actually 71.04 GB in the same units — already
+                         // over the limit).
+                         << "| RAM_inflight=" << QLocale().formattedDataSize(ramInFlight.load(), 2, QLocale::DataSizeSIFormat)
+                         << "/ limit=" << QLocale().formattedDataSize(ramLimit, 2, QLocale::DataSizeSIFormat)
                          << "| writeMap_depth_max=" << writeMapDepthMax.load()
                          << "| reader_stalls="      << readerStalls.load()
                          << "| elapsed=" << QString::number(elapsed,'f',0) << "s";
