@@ -254,7 +254,15 @@ MainWindow::MainWindow(QWidget *parent)
     });
 
     qApp->setStyleSheet(R"(
-QMainWindow, QWidget#centralwidget { background: #1e1e2e; }
+QMainWindow, QWidget#centralwidget, QWidget#tabBackup, QWidget#tabRebuild { background: #1e1e2e; }
+QTabWidget::pane { border: none; background: #1e1e2e; }
+QTabBar::tab {
+    background: #313244; color: #a6adc8; border: 1px solid #45475a;
+    border-bottom: none; border-top-left-radius: 4px; border-top-right-radius: 4px;
+    padding: 6px 18px; margin-right: 2px;
+}
+QTabBar::tab:selected { background: #1e1e2e; color: #cdd6f4; border-color: #585b70; }
+QTabBar::tab:hover:!selected { background: #3a3a4a; }
 QLabel { color: #a6adc8; }
 QComboBox, QLineEdit {
     background: #313244; border: 1px solid #45475a; border-radius: 3px;

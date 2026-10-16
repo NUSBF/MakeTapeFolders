@@ -3,13 +3,13 @@
  <class>MainWindow</class>
  <widget class="QMainWindow" name="MainWindow">
   <property name="geometry">
-   <rect><x>0</x><y>0</y><width>1908</width><height>1024</height></rect>
+   <rect><x>0</x><y>0</y><width>1908</width><height>1060</height></rect>
   </property>
   <property name="windowTitle"><string>MakeTapeFolders</string></property>
   <widget class="QWidget" name="centralwidget">
 
    <widget class="QTabWidget" name="tabWidgetMain">
-    <property name="geometry"><rect><x>0</x><y>0</y><width>1908</width><height>1002</height></rect></property>
+    <property name="geometry"><rect><x>0</x><y>0</y><width>1908</width><height>1038</height></rect></property>
     <property name="currentIndex"><number>0</number></property>
 
     <!-- ================================================================ -->
