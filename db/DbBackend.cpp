@@ -673,27 +673,55 @@ FolderTotals DbBackend::sumDoneBytesForFolder(const QString& sourceRoot, const Q
     return t;
 }
 
-QVector<TapeInfo> DbBackend::listTapesForSource(const QString& sourceRoot)
+QVector<TapeInfo> DbBackend::listAllTapes()
 {
     // SUBSTR(dst, 1, INSTR(dst, '/') - 1) takes everything before the first
     // '/' in dst (e.g. "tape_014/2021/.../FoilHole_....jpg.gz" ->
     // "tape_014") — both SUBSTR and INSTR are 1-indexed builtins present in
     // both SQLite and MariaDB (no SUBSTRING_INDEX here, that's MariaDB-only).
     // Verified directly against the real done table before relying on it.
+    //
+    // Deliberately not scoped to one source_root: a tape is a shared,
+    // sequential destination that can accumulate files from more than one
+    // source root over its lifetime, so listing tapes has to span the
+    // whole table, not one source's slice of it.
     QSqlDatabase db = connection();
     QSqlQuery q(db);
     q.setForwardOnly(true);
-    q.prepare("SELECT SUBSTR(dst, 1, INSTR(dst, '/') - 1) AS tape, COUNT(*), SUM(gz_bytes) "
-              "FROM done WHERE source_root = ? GROUP BY tape ORDER BY tape");
-    q.addBindValue(sourceRoot);
+    q.prepare("SELECT SUBSTR(dst, 1, INSTR(dst, '/') - 1) AS tape, "
+              "COUNT(*), SUM(gz_bytes), COUNT(DISTINCT source_root) "
+              "FROM done GROUP BY tape ORDER BY tape");
     QVector<TapeInfo> out;
     if (q.exec()) {
         while (q.next()) {
             TapeInfo t;
-            t.tapeName   = q.value(0).toString();
-            t.fileCount  = q.value(1).toInt();
-            t.gzBytesSum = q.value(2).toLongLong();
+            t.tapeName            = q.value(0).toString();
+            t.fileCount            = q.value(1).toInt();
+            t.gzBytesSum           = q.value(2).toLongLong();
+            t.distinctSourceRoots = q.value(3).toInt();
             out.push_back(t);
+        }
+    }
+    return out;
+}
+
+QVector<TapeDoneItem> DbBackend::loadDoneForTape(const QString& tapeName)
+{
+    QSqlDatabase db = connection();
+    QSqlQuery q(db);
+    q.setForwardOnly(true);
+    q.prepare("SELECT source_root, src, dst, bytes, gz_bytes FROM done WHERE dst LIKE ?");
+    q.addBindValue(tapeName + "/%");
+    QVector<TapeDoneItem> out;
+    if (q.exec()) {
+        while (q.next()) {
+            TapeDoneItem it;
+            it.sourceRoot = q.value(0).toString();
+            it.src        = q.value(1).toString();
+            it.dst        = q.value(2).toString();
+            it.bytes      = q.value(3).toLongLong();
+            it.gzBytes    = q.value(4).toLongLong();
+            out.push_back(it);
         }
     }
     return out;

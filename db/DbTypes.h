@@ -41,11 +41,28 @@ struct FolderTotals {
 };
 
 // One row of the Rebuild tab's tape list — a tape_NNN folder name recorded
-// in done for some source, with its aggregate file count/size.
+// in done, across ALL source roots (a tape is a shared, sequential
+// destination that can accumulate files from more than one source root
+// over its lifetime — it's not scoped to a single source), with its
+// aggregate file count/size and how many distinct source roots fed it.
 struct TapeInfo {
     QString tapeName;
-    int     fileCount  = 0;
-    qint64  gzBytesSum = 0;
+    int     fileCount           = 0;
+    qint64  gzBytesSum          = 0;
+    int     distinctSourceRoots = 0;
+};
+
+// One manifest row for a tape being rebuilt. Unlike DoneVerifyItem (which
+// is scoped to one source_root, correct for Phase 1 verify's purposes),
+// sourceRoot travels WITH each row here — the same tape can genuinely mix
+// rows from different source roots, and each file can only be found again
+// under its own source_root + src, not a single fixed one for the tape.
+struct TapeDoneItem {
+    QString sourceRoot;
+    QString src;
+    QString dst;
+    qint64  bytes   = 0;
+    qint64  gzBytes = 0;
 };
 
 // Snapshot of a backend's current state — used by the reconcile UI to show

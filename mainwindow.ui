@@ -321,25 +321,18 @@
      <!-- ============================================================ -->
      <!-- SELECTION & SCOPE                                             -->
      <!-- ============================================================ -->
-     <widget class="QLabel" name="labelRebuildSourceLbl">
-      <property name="geometry"><rect><x>10</x><y>8</y><width>90</width><height>26</height></rect></property>
-      <property name="text"><string>Source root:</string></property>
-     </widget>
-     <widget class="QComboBox" name="comboBoxRebuildSourceRoot">
-      <property name="geometry"><rect><x>105</x><y>8</y><width>640</width><height>26</height></rect></property>
-     </widget>
      <widget class="QPushButton" name="pushButtonRefreshTapeList">
-      <property name="geometry"><rect><x>755</x><y>8</y><width>180</width><height>26</height></rect></property>
+      <property name="geometry"><rect><x>10</x><y>8</y><width>180</width><height>26</height></rect></property>
       <property name="text"><string>Refresh tape list</string></property>
      </widget>
      <widget class="QLabel" name="labelRebuildSourceStats">
-      <property name="geometry"><rect><x>945</x><y>8</y><width>945</width><height>26</height></rect></property>
+      <property name="geometry"><rect><x>200</x><y>8</y><width>1690</width><height>26</height></rect></property>
       <property name="text"><string></string></property>
      </widget>
 
      <widget class="QLabel" name="labelTapeListLbl">
-      <property name="geometry"><rect><x>10</x><y>40</y><width>400</width><height>20</height></rect></property>
-      <property name="text"><string>Tapes recorded in the done table for this source (check the ones to rebuild):</string></property>
+      <property name="geometry"><rect><x>10</x><y>40</y><width>700</width><height>20</height></rect></property>
+      <property name="text"><string>Tapes recorded in the done table — a tape can span more than one source root (check the ones to rebuild):</string></property>
      </widget>
      <widget class="QListWidget" name="listWidgetTapes">
       <property name="geometry"><rect><x>10</x><y>62</y><width>1880</width><height>200</height></rect></property>

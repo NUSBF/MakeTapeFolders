@@ -352,7 +352,7 @@ QProgressBar#progressBarShutdown::chunk { background: #f38ba8; border-radius: 3p
 
     qDebug() << "[INIT 15] calling populateSourceRoots…";
     populateSourceRoots();
-    populateRebuildSourceRoots();
+    on_pushButtonRefreshTapeList_clicked();
     qDebug() << "[INIT 16] constructor done — window should appear now";
 }
 
@@ -644,7 +644,6 @@ void MainWindow::on_comboBoxSourceRoot_currentIndexChanged(int index)
             // specific prerequisites (a tape checked, a destination chosen)
             // are validated on click, same convention as pushButtonStart.
             if (!backupFuture.isRunning() && !rebuildFuture.isRunning()) {
-                ui->comboBoxRebuildSourceRoot->setEnabled(true);
                 ui->pushButtonRefreshTapeList->setEnabled(true);
                 ui->pushButtonRebuildDest->setEnabled(true);
                 ui->pushButtonScanRebuild->setEnabled(true);
@@ -871,10 +870,12 @@ void MainWindow::runScan(const QString& scanRoot, const QString& sourceRoot)
         .arg(QString::number(mbps,'f',1)));
     setEnabled(true);
 
-    // Refresh source root dropdown (adds new root if this was a new directory)
+    // Refresh source root dropdown (adds new root if this was a new directory).
+    // The Rebuild tab's tape list is unaffected by a source scan — tapes
+    // come from the done table (actual backup writes), not from files (the
+    // source inventory a scan populates), so nothing to refresh there.
     QMetaObject::invokeMethod(this, [this]{
         populateSourceRoots();
-        populateRebuildSourceRoots();
     }, Qt::QueuedConnection);
 }
 
@@ -2643,7 +2644,7 @@ void MainWindow::switchActiveBackend(DbBackend::Kind kind)
     }
     updateBackendButtons();
     populateSourceRoots();
-    populateRebuildSourceRoots();
+    on_pushButtonRefreshTapeList_clicked();
 }
 
 void MainWindow::updateBackendButtons()
@@ -2734,74 +2735,38 @@ void MainWindow::on_lineEditLtfsOverhead_textChanged(const QString &arg1)
 // under that constraint.
 // ---------------------------------------------------------------------------
 
-void MainWindow::populateRebuildSourceRoots()
-{
-    QThreadPool::globalInstance()->start([this]() {
-        QStringList roots;
-        if (m_db) {
-            QueryHeartbeat hb("populateRebuildSourceRoots: SELECT DISTINCT source_root");
-            roots = m_db->sourceRoots();
-        }
-        QMetaObject::invokeMethod(this, [this, roots]() {
-            QString prev = ui->comboBoxRebuildSourceRoot->currentText();
-            ui->comboBoxRebuildSourceRoot->blockSignals(true);
-            ui->comboBoxRebuildSourceRoot->clear();
-            for (const QString& r : roots) ui->comboBoxRebuildSourceRoot->addItem(r);
-            int idx = ui->comboBoxRebuildSourceRoot->findText(prev);
-            ui->comboBoxRebuildSourceRoot->setCurrentIndex(idx >= 0 ? idx : 0);
-            ui->comboBoxRebuildSourceRoot->blockSignals(false);
-        }, Qt::QueuedConnection);
-    });
-}
-
 void MainWindow::setRebuildControlsEnabled(bool en)
 {
-    ui->comboBoxRebuildSourceRoot->setEnabled(en);
     ui->pushButtonRefreshTapeList->setEnabled(en);
     ui->listWidgetTapes->setEnabled(en);
     ui->pushButtonRebuildDest->setEnabled(en);
     ui->pushButtonScanRebuild->setEnabled(en);
 }
 
-void MainWindow::on_comboBoxRebuildSourceRoot_currentIndexChanged(int /*index*/)
-{
-    // Scope changed — whatever was scanned no longer applies.
-    ui->listWidgetTapes->clear();
-    ui->labelRebuildSummary->setText("");
-    ui->plainTextEditMissing->clear();
-    ui->pushButtonSaveMissingList->setEnabled(false);
-    ui->pushButtonStartRebuild->setEnabled(false);
-    m_rebuildManifest.clear();
-    ui->labelScanRebuildStatus->setText(
-        "Pick a source root, check at least one tape, and set a destination.");
-}
-
 void MainWindow::on_pushButtonRefreshTapeList_clicked()
 {
     if (!m_db) { QMessageBox::critical(this, "Error", "Session database not open."); return; }
-    QString sourceRoot = ui->comboBoxRebuildSourceRoot->currentText();
-    if (sourceRoot.isEmpty()) {
-        QMessageBox::critical(this, "Error", "Select a source root first.");
-        return;
-    }
     ui->pushButtonRefreshTapeList->setEnabled(false);
     ui->listWidgetTapes->clear();
-    QThreadPool::globalInstance()->start([this, sourceRoot]() {
+    QThreadPool::globalInstance()->start([this]() {
         QElapsedTimer t; t.start();
         QVector<TapeInfo> tapes;
         {
-            QueryHeartbeat hb(QString("listTapesForSource(%1)").arg(sourceRoot));
-            tapes = m_db->listTapesForSource(sourceRoot);
+            QueryHeartbeat hb("listAllTapes()");
+            tapes = m_db->listAllTapes();
         }
-        qDebug() << "[REBUILD] listTapesForSource(" << sourceRoot << ") found" << tapes.size()
+        qDebug() << "[REBUILD] listAllTapes() found" << tapes.size()
                  << "tape(s), took" << t.elapsed() << "ms";
         QMetaObject::invokeMethod(this, [this, tapes]() {
             ui->listWidgetTapes->clear();
             for (const TapeInfo& ti : tapes) {
-                QString label = QString("%1  —  %2 files, %3")
+                QString label = QString("%1  —  %2 files, %3%4")
                     .arg(ti.tapeName)
                     .arg(QLocale().toString(ti.fileCount))
-                    .arg(QLocale().formattedDataSize(ti.gzBytesSum, 2, QLocale::DataSizeSIFormat));
+                    .arg(QLocale().formattedDataSize(ti.gzBytesSum, 2, QLocale::DataSizeSIFormat))
+                    .arg(ti.distinctSourceRoots > 1
+                             ? QString("  (%1 source roots)").arg(ti.distinctSourceRoots)
+                             : QString());
                 auto* item = new QListWidgetItem(label, ui->listWidgetTapes);
                 item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
                 item->setCheckState(Qt::Unchecked);
@@ -2809,7 +2774,15 @@ void MainWindow::on_pushButtonRefreshTapeList_clicked()
             }
             ui->pushButtonRefreshTapeList->setEnabled(true);
             ui->labelRebuildSourceStats->setText(
-                QString("%1 tape(s) on record for this source").arg(tapes.size()));
+                QString("%1 tape(s) on record").arg(tapes.size()));
+            // A re-refresh invalidates whatever was scanned/checked before.
+            ui->labelRebuildSummary->setText("");
+            ui->plainTextEditMissing->clear();
+            ui->pushButtonSaveMissingList->setEnabled(false);
+            ui->pushButtonStartRebuild->setEnabled(false);
+            m_rebuildManifest.clear();
+            ui->labelScanRebuildStatus->setText(
+                "Check at least one tape and set a destination, then Scan.");
         }, Qt::QueuedConnection);
     });
 }
@@ -2833,11 +2806,6 @@ void MainWindow::on_pushButtonRebuildDest_clicked()
 void MainWindow::on_pushButtonScanRebuild_clicked()
 {
     if (!m_db) { QMessageBox::critical(this, "Error", "Session database not open."); return; }
-    QString sourceRoot = ui->comboBoxRebuildSourceRoot->currentText();
-    if (sourceRoot.isEmpty() || !QDir(sourceRoot).exists()) {
-        QMessageBox::critical(this, "Error", "Select a valid source root first.");
-        return;
-    }
     QStringList tapeNames;
     for (int i = 0; i < ui->listWidgetTapes->count(); ++i) {
         QListWidgetItem* item = ui->listWidgetTapes->item(i);
@@ -2862,14 +2830,15 @@ void MainWindow::on_pushButtonScanRebuild_clicked()
     ui->labelRebuildSummary->setText("");
     m_rebuildManifest.clear();
 
-    rebuildScanFuture = QtConcurrent::run([this, sourceRoot, tapeNames]() {
-        runRebuildScan(sourceRoot, tapeNames);
+    rebuildScanFuture = QtConcurrent::run([this, tapeNames]() {
+        runRebuildScan(tapeNames);
     });
 }
 
-void MainWindow::runRebuildScan(const QString& sourceRoot, const QStringList& tapeNames)
+void MainWindow::runRebuildScan(const QStringList& tapeNames)
 {
-    qDebug() << "[REBUILD-SCAN] starting — source:" << sourceRoot << "tapes:" << tapeNames;
+    qDebug() << "[REBUILD-SCAN] starting — tapes:" << tapeNames
+             << "(each tape's rows carry their own source_root — a tape is not scoped to one source)";
     QElapsedTimer timer; timer.start();
 
     std::vector<RebuildManifestItem> manifest;
@@ -2879,11 +2848,10 @@ void MainWindow::runRebuildScan(const QString& sourceRoot, const QStringList& ta
 
     for (const QString& tapeName : tapeNames) {
         if (stopRequested.load()) break;
-        QString pattern = tapeName + "/%";
-        QVector<DoneVerifyItem> rows;
+        QVector<TapeDoneItem> rows;
         {
-            QueryHeartbeat hb(QString("Rebuild scan: loadDoneForVerification(%1)").arg(tapeName));
-            rows = m_db->loadDoneForVerification(sourceRoot, pattern);
+            QueryHeartbeat hb(QString("Rebuild scan: loadDoneForTape(%1)").arg(tapeName));
+            rows = m_db->loadDoneForTape(tapeName);
         }
         qDebug() << "[REBUILD-SCAN]" << tapeName << "—" << rows.size()
                  << "manifest rows from done table (read-only)";
@@ -2895,18 +2863,22 @@ void MainWindow::runRebuildScan(const QString& sourceRoot, const QStringList& ta
 
         int checked = 0;
         qint64 lastLogMs = 0;
-        for (const DoneVerifyItem& row : rows) {
+        for (const TapeDoneItem& row : rows) {
             if (stopRequested.load()) break;
             RebuildManifestItem item;
-            item.src           = row.src;
-            item.tapeName      = tapeName;
-            item.bytes         = row.bytes;
-            item.gzBytes       = row.gzBytes;
-            item.foundOnSource = QFileInfo::exists(sourceRoot + "/" + row.src);
+            item.sourceRoot     = row.sourceRoot;
+            item.src            = row.src;
+            item.tapeName       = tapeName;
+            item.bytes          = row.bytes;
+            item.gzBytes        = row.gzBytes;
+            item.foundOnSource  = QFileInfo::exists(row.sourceRoot + "/" + row.src);
 
             totalBytesManifest += item.bytes;
             if (item.foundOnSource) { ++foundCount; foundBytes += item.bytes; }
-            else { ++missingCount; missingBytes += item.bytes; missingLines << (tapeName + "/" + item.src); }
+            else {
+                ++missingCount; missingBytes += item.bytes;
+                missingLines << QString("%1/%2  [source: %3]").arg(tapeName, item.src, item.sourceRoot);
+            }
 
             manifest.push_back(item);
             ++checked;
@@ -2990,10 +2962,9 @@ void MainWindow::on_pushButtonStartRebuild_clicked()
         QMessageBox::information(this, "Rebuild", "Rebuild is already running.");
         return;
     }
-    QString sourceRoot = ui->comboBoxRebuildSourceRoot->currentText();
     QString outputBase = rebuildDestDir.path();
-    if (sourceRoot.isEmpty() || outputBase.isEmpty() || !QDir(outputBase).exists()) {
-        QMessageBox::critical(this, "Error", "Source root and destination must be set.");
+    if (outputBase.isEmpty() || !QDir(outputBase).exists()) {
+        QMessageBox::critical(this, "Error", "Select a valid destination for rebuild output first.");
         return;
     }
 
@@ -3005,8 +2976,8 @@ void MainWindow::on_pushButtonStartRebuild_clicked()
     ui->labelRebuildStatus->setText("Starting…");
     ui->progressBarRebuild->setValue(0);
 
-    rebuildFuture = QtConcurrent::run([this, sourceRoot, outputBase]() {
-        runRebuild(sourceRoot, outputBase);
+    rebuildFuture = QtConcurrent::run([this, outputBase]() {
+        runRebuild(outputBase);
     });
 }
 
@@ -3017,10 +2988,11 @@ void MainWindow::on_pushButtonStopRebuild_clicked()
     qDebug() << "[REBUILD] Stop button clicked";
 }
 
-void MainWindow::runRebuild(const QString& sourceRoot, const QString& outputBase)
+void MainWindow::runRebuild(const QString& outputBase)
 {
-    qDebug() << "[REBUILD] ── starting — source:" << sourceRoot << "output:" << outputBase
-             << "(database will not be written to) ──────────────────────";
+    qDebug() << "[REBUILD] ── starting — output:" << outputBase
+             << "(each file reads from its own recorded source_root; "
+             << "database will not be written to) ──────────────────────";
 
     // Only the files the scan actually found on source — the missing ones
     // are already surfaced in plainTextEditMissing, nothing to attempt here.
@@ -3123,7 +3095,7 @@ void MainWindow::runRebuild(const QString& sourceRoot, const QString& outputBase
         }
         if (stopRequested.load()) break;
 
-        pool.start([this, item, sourceRoot, outputBase, &ramInFlight, &ramMutex, &ramCV,
+        pool.start([this, item, outputBase, &ramInFlight, &ramMutex, &ramCV,
                     &filesAttempted, &filesRebuilt, &filesSkippedExisting, &filesFailed,
                     &activeReading, &activeCompressing, &activeWriting, &bytesWritten,
                     &lastLogMs, &totalTimer]() mutable {
@@ -3148,7 +3120,7 @@ void MainWindow::runRebuild(const QString& sourceRoot, const QString& outputBase
 
             ramInFlight.fetch_add(2 * item.bytes);
             activeReading.fetch_add(1);
-            QString srcPath = sourceRoot + "/" + item.src;
+            QString srcPath = item.sourceRoot + "/" + item.src;
             QFile inF(srcPath);
             if (!inF.open(QIODevice::ReadOnly)) {
                 activeReading.fetch_add(-1);

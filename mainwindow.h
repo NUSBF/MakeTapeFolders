@@ -47,7 +47,6 @@ private slots:
     void on_lineEditLtfsOverhead_textChanged(const QString &arg1);
 
     // ---- Rebuild from Source tab ------------------------------------------
-    void on_comboBoxRebuildSourceRoot_currentIndexChanged(int index);
     void on_pushButtonRefreshTapeList_clicked();
     void on_pushButtonRebuildDest_clicked();
     void on_pushButtonScanRebuild_clicked();
@@ -84,16 +83,19 @@ private:
     // the done table (read-only), foundOnSource is a live filesystem check.
     // Both the scan and the rebuild pipeline consume this same list, so a
     // rebuild run never has to touch the database to know what to attempt.
+    // sourceRoot travels per-item, not as one fixed value for the whole
+    // run — a tape is a shared destination that can mix files recorded
+    // under different source roots over its lifetime.
     struct RebuildManifestItem {
+        QString sourceRoot;
         QString src;
         QString tapeName;
         qint64  bytes         = 0;
         qint64  gzBytes       = 0;
         bool    foundOnSource = false;
     };
-    void runRebuildScan(const QString& sourceRoot, const QStringList& tapeNames);
-    void runRebuild(const QString& sourceRoot, const QString& outputBase);
-    void populateRebuildSourceRoots();
+    void runRebuildScan(const QStringList& tapeNames);
+    void runRebuild(const QString& outputBase);
     void setRebuildControlsEnabled(bool en);
 
     Ui::MainWindow *ui;
