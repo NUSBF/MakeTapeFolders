@@ -40,6 +40,14 @@ struct FolderTotals {
     int    count      = 0;
 };
 
+// One row of the Rebuild tab's tape list — a tape_NNN folder name recorded
+// in done for some source, with its aggregate file count/size.
+struct TapeInfo {
+    QString tapeName;
+    int     fileCount  = 0;
+    qint64  gzBytesSum = 0;
+};
+
 // Snapshot of a backend's current state — used by the reconcile UI to show
 // "what's actually in this database right now" before syncing.
 struct DbState {

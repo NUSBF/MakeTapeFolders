@@ -73,6 +73,11 @@ public:
 
     QSet<QString> allDstForSource(const QString& sourceRoot);
     FolderTotals sumDoneBytesForFolder(const QString& sourceRoot, const QString& folderLikePattern);
+
+    // ---- Rebuild from Source (read-only) --------------------------------------
+    // Distinct tape_NNN folders recorded in done for this source, with each
+    // tape's file count/total size — populates the Rebuild tab's tape list.
+    QVector<TapeInfo> listTapesForSource(const QString& sourceRoot);
     bool sourceFileSize(const QString& sourceRoot, const QString& src, qint64* outSize);
     void insertOrphanDone(const QString& sourceRoot, const QString& src, const QString& dst,
                            qint64 bytes, qint64 gzBytes, double ratio);

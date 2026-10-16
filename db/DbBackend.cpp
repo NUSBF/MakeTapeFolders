@@ -673,6 +673,32 @@ FolderTotals DbBackend::sumDoneBytesForFolder(const QString& sourceRoot, const Q
     return t;
 }
 
+QVector<TapeInfo> DbBackend::listTapesForSource(const QString& sourceRoot)
+{
+    // SUBSTR(dst, 1, INSTR(dst, '/') - 1) takes everything before the first
+    // '/' in dst (e.g. "tape_014/2021/.../FoilHole_....jpg.gz" ->
+    // "tape_014") — both SUBSTR and INSTR are 1-indexed builtins present in
+    // both SQLite and MariaDB (no SUBSTRING_INDEX here, that's MariaDB-only).
+    // Verified directly against the real done table before relying on it.
+    QSqlDatabase db = connection();
+    QSqlQuery q(db);
+    q.setForwardOnly(true);
+    q.prepare("SELECT SUBSTR(dst, 1, INSTR(dst, '/') - 1) AS tape, COUNT(*), SUM(gz_bytes) "
+              "FROM done WHERE source_root = ? GROUP BY tape ORDER BY tape");
+    q.addBindValue(sourceRoot);
+    QVector<TapeInfo> out;
+    if (q.exec()) {
+        while (q.next()) {
+            TapeInfo t;
+            t.tapeName   = q.value(0).toString();
+            t.fileCount  = q.value(1).toInt();
+            t.gzBytesSum = q.value(2).toLongLong();
+            out.push_back(t);
+        }
+    }
+    return out;
+}
+
 bool DbBackend::sourceFileSize(const QString& sourceRoot, const QString& src, qint64* outSize)
 {
     // Indexed lookup via src_hash (source_root, src) has no standalone index
