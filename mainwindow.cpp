@@ -133,6 +133,50 @@ static bool isValidGzip(const QString& path, qint64 expectedOriginalSize = -1)
     return isize == (quint32)(expectedOriginalSize & 0xFFFFFFFF);
 }
 
+// Gzip-compress input into output (Z_BEST_SPEED, windowBits=15+16 for a
+// real gzip header/trailer). Extracted out of runBackup()'s compress
+// lambda so the Rebuild pipeline can reuse the exact same compression
+// behavior without duplicating the deflate loop. stopFlag is checked once
+// per deflate() call, same as before — pass a per-run atomic so a
+// cancelled backup or a cancelled rebuild only aborts its own compression,
+// not each other's.
+static bool gzipCompress(const QByteArray& input, QByteArray* output,
+                          QString* failReason, std::atomic<bool>& stopFlag)
+{
+    z_stream zs = {};
+    if (deflateInit2(&zs, Z_BEST_SPEED, Z_DEFLATED, 15+16, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
+        if (failReason) *failReason = "deflateInit2 failed";
+        return false;
+    }
+    QByteArray out;
+    out.reserve(input.size() / 2);
+    QByteArray outBuf(4 << 20, 0);
+    bool zerr = false;
+    zs.next_in  = (Bytef*)input.constData();
+    zs.avail_in = (uInt)input.size();
+    int ret = Z_OK;
+    do {
+        if (stopFlag.load()) {
+            zerr = true;
+            if (failReason) *failReason = "aborted: stopRequested during deflate";
+            break;
+        }
+        zs.next_out  = (Bytef*)outBuf.data();
+        zs.avail_out = (uInt)outBuf.size();
+        ret = deflate(&zs, zs.avail_in == 0 ? Z_FINISH : Z_NO_FLUSH);
+        if (ret == Z_STREAM_ERROR) {
+            zerr = true;
+            if (failReason) *failReason = "Z_STREAM_ERROR from deflate()";
+            break;
+        }
+        out.append(outBuf.constData(), outBuf.size() - (int)zs.avail_out);
+    } while (ret != Z_STREAM_END);
+    deflateEnd(&zs);
+    if (zerr) return false;
+    *output = out;
+    return true;
+}
+
 // Scan existing folder and return raw/tar/LTFS byte totals for resume.
 struct FolderSizes {
     qint64 actualBytes = 0; // raw sum of file sizes — informational only, never a hard limit
@@ -2304,37 +2348,7 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
                     w.gzData = inputData;
                     w.ok     = true;
                 } else {
-                    z_stream zs = {};
-                    if (deflateInit2(&zs, Z_BEST_SPEED, Z_DEFLATED,
-                                     15+16, 8, Z_DEFAULT_STRATEGY) == Z_OK) {
-                        QByteArray out;
-                        out.reserve(inputData.size() / 2);
-                        QByteArray outBuf(4 << 20, 0);
-                        bool zerr = false;
-                        zs.next_in  = (Bytef*)inputData.constData();
-                        zs.avail_in = (uInt)inputData.size();
-                        int ret = Z_OK;
-                        do {
-                            if (this->stopRequested.load()) {
-                                zerr = true;
-                                w.failReason = "aborted: stopRequested during deflate";
-                                break;
-                            }
-                            zs.next_out  = (Bytef*)outBuf.data();
-                            zs.avail_out = (uInt)outBuf.size();
-                            ret = deflate(&zs, zs.avail_in == 0 ? Z_FINISH : Z_NO_FLUSH);
-                            if (ret == Z_STREAM_ERROR) {
-                                zerr = true;
-                                w.failReason = "Z_STREAM_ERROR from deflate()";
-                                break;
-                            }
-                            out.append(outBuf.constData(), outBuf.size() - (int)zs.avail_out);
-                        } while (ret != Z_STREAM_END);
-                        deflateEnd(&zs);
-                        if (!zerr) { w.gzData = out; w.ok = true; }
-                    } else {
-                        w.failReason = "deflateInit2 failed";
-                    }
+                    w.ok = gzipCompress(inputData, &w.gzData, &w.failReason, this->stopRequested);
                 }
                 w.compress_ms = ct.elapsed();
 
