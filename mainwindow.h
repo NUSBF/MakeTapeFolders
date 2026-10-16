@@ -46,6 +46,15 @@ private slots:
     void on_pushButtonLimitByLtfs_clicked();
     void on_lineEditLtfsOverhead_textChanged(const QString &arg1);
 
+    // ---- Rebuild from Source tab ------------------------------------------
+    void on_comboBoxRebuildSourceRoot_currentIndexChanged(int index);
+    void on_pushButtonRefreshTapeList_clicked();
+    void on_pushButtonRebuildDest_clicked();
+    void on_pushButtonScanRebuild_clicked();
+    void on_pushButtonSaveMissingList_clicked();
+    void on_pushButtonStartRebuild_clicked();
+    void on_pushButtonStopRebuild_clicked();
+
 private:
     void runScan(const QString& scanRoot, const QString& sourceRoot);
     void runBackup(const QString& prefix, qint64 maxFolderSize, qint64 ltfsIndexOverheadBytes);
@@ -64,6 +73,28 @@ private:
 
     void closeEvent(QCloseEvent* event) override;
     void initiateShutdown();
+    // Separate from initiateShutdown() deliberately: the rebuild pipeline
+    // is a plain bounded QThreadPool with no persistent writer thread or
+    // unbounded writeMap to force-kill, so it doesn't need (or fit) that
+    // 4-step choreography — stopRequested + a bounded wait is sufficient.
+    void initiateRebuildShutdown();
+
+    // ---- Rebuild from Source ------------------------------------------------
+    // Manifest entry produced by the Scan step — src/sizes come straight from
+    // the done table (read-only), foundOnSource is a live filesystem check.
+    // Both the scan and the rebuild pipeline consume this same list, so a
+    // rebuild run never has to touch the database to know what to attempt.
+    struct RebuildManifestItem {
+        QString src;
+        QString tapeName;
+        qint64  bytes         = 0;
+        qint64  gzBytes       = 0;
+        bool    foundOnSource = false;
+    };
+    void runRebuildScan(const QString& sourceRoot, const QStringList& tapeNames);
+    void runRebuild(const QString& sourceRoot, const QString& outputBase);
+    void populateRebuildSourceRoots();
+    void setRebuildControlsEnabled(bool en);
 
     Ui::MainWindow *ui;
     QSettings settings;
@@ -73,6 +104,19 @@ private:
 
     QFuture<void> scanFuture;
     QFuture<void> backupFuture;
+
+    // Rebuild tab — a separate output root from destinationdir (never the
+    // live, currently-incrementing tape sequence), and its own futures.
+    // Mutually exclusive with backupFuture by construction (confirmed
+    // design decision): both would otherwise independently size a RAM
+    // budget from the same MemAvailable and hit the same source NFS.
+    // Shares stopRequested with the backup pipeline rather than duplicating
+    // it — safe precisely because only one of the two can ever be running.
+    QDir rebuildDestDir{"/home/data"};
+    QFuture<void> rebuildScanFuture;
+    QFuture<void> rebuildFuture;
+    std::vector<RebuildManifestItem> m_rebuildManifest;
+
     std::atomic<bool> stopRequested{false};
     std::atomic<bool> forceKillWriter{false};
     bool m_shuttingDown = false;
@@ -95,6 +139,7 @@ private:
     std::atomic<HardLimitModel> activeHardLimitModel{HardLimitModel::Tar};
 
     QTimer*       m_pipelineTimer   = nullptr;
+    QTimer*       m_rebuildPipelineTimer = nullptr;
     QTimer*       m_dbLoadDispTimer = nullptr;
     QElapsedTimer m_dbLoadTimer;
 

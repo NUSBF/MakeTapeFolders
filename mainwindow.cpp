@@ -10,6 +10,7 @@
 #include <QMessageBox>
 #include <QStandardPaths>
 #include <QTableWidgetItem>
+#include <QListWidgetItem>
 #include <QThreadPool>
 #include <QLocale>
 #include <QtConcurrent/QtConcurrent>
@@ -343,6 +344,7 @@ QProgressBar#progressBarShutdown::chunk { background: #f38ba8; border-radius: 3p
 
     qDebug() << "[INIT 15] calling populateSourceRoots…";
     populateSourceRoots();
+    populateRebuildSourceRoots();
     qDebug() << "[INIT 16] constructor done — window should appear now";
 }
 
@@ -374,13 +376,14 @@ void MainWindow::closeEvent(QCloseEvent* event)
     // Kill any in-progress DB query immediately
     if (m_db) m_db->interrupt();
 
-    if (!backupFuture.isRunning()) {
+    if (!backupFuture.isRunning() && !rebuildFuture.isRunning()) {
         settings.setValue("geometry", saveGeometry());
         event->accept();
         return;
     }
     event->ignore();
-    initiateShutdown();
+    if (backupFuture.isRunning()) initiateShutdown();
+    else                          initiateRebuildShutdown();
 }
 
 void MainWindow::initiateShutdown()
@@ -496,6 +499,57 @@ void MainWindow::initiateShutdown()
     });
 }
 
+void MainWindow::initiateRebuildShutdown()
+{
+    if (m_shuttingDown) return;
+    m_shuttingDown = true;
+
+    ui->groupBoxShutdown->setVisible(true);
+    ui->progressBarShutdown->setValue(0);
+    ui->plainTextEditShutdown->clear();
+    ui->pushButtonStartRebuild->setEnabled(false);
+    ui->pushButtonStopRebuild->setEnabled(false);
+
+    auto log = [this](const QString& msg, int step = -1) {
+        QMetaObject::invokeMethod(this, [this, msg, step] {
+            ui->plainTextEditShutdown->appendPlainText(msg);
+            if (step >= 0) ui->progressBarShutdown->setValue(step);
+        }, Qt::QueuedConnection);
+    };
+
+    QThreadPool::globalInstance()->start([this, log] {
+        log("Shutdown initiated (Rebuild).", 0);
+        qDebug() << "[STOP] window closed while rebuild running — initiating shutdown";
+        stopRequested.store(true);
+        log("  [1/2] Stop signal sent — waiting for the current file's read/compress/write "
+            "to finish (no persistent writer thread to force-kill here, unlike Backup)...", 2);
+
+        // Each in-flight pool task is bounded to a single file's
+        // read+compress+write, not an indefinite operation — a generous
+        // flat timeout is enough; there's no files-in-queue count to scale
+        // it from the way runBackup() does (no writeMap in this pipeline).
+        QElapsedTimer t; t.start();
+        const int timeout_ms = 5 * 60 * 1000;
+        while (rebuildFuture.isRunning() && t.elapsed() < timeout_ms)
+            QThread::msleep(200);
+
+        if (!rebuildFuture.isRunning()) {
+            log("  [2/2] Rebuild thread returned cleanly — RAM released.", 4);
+        } else {
+            log("  [2/2] WARNING: still running after 5 min (likely a blocked NFS read/write "
+                "that can't be cancelled) — force-quitting now instead of hanging indefinitely.", 4);
+            qDebug() << "[STOP] rebuild thread unresponsive after timeout — hard exit";
+            std::_Exit(0);
+        }
+
+        settings.setValue("geometry", saveGeometry());
+        QMetaObject::invokeMethod(this, [this] {
+            m_shuttingDown = false;
+            close();
+        }, Qt::QueuedConnection);
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Tab 1 — Populate source root dropdown from DB and show per-root stats
 // ---------------------------------------------------------------------------
@@ -578,6 +632,15 @@ void MainWindow::on_comboBoxSourceRoot_currentIndexChanged(int index)
             ui->lineEditMaxSize->setEnabled(true);
             if (!backupFuture.isRunning() && !scanFuture.isRunning())
                 ui->pushButtonStart->setEnabled(true);
+            // Rebuild tab becomes usable at the same "DB is ready" point —
+            // specific prerequisites (a tape checked, a destination chosen)
+            // are validated on click, same convention as pushButtonStart.
+            if (!backupFuture.isRunning() && !rebuildFuture.isRunning()) {
+                ui->comboBoxRebuildSourceRoot->setEnabled(true);
+                ui->pushButtonRefreshTapeList->setEnabled(true);
+                ui->pushButtonRebuildDest->setEnabled(true);
+                ui->pushButtonScanRebuild->setEnabled(true);
+            }
             // pushButtonStop stays disabled — only enabled when backup is running
             ui->labelScanStatus->setText(
                 QString("Ready  (DB loaded in %1 s)").arg(loadMs / 1000.0, 0, 'f', 2));
@@ -803,6 +866,7 @@ void MainWindow::runScan(const QString& scanRoot, const QString& sourceRoot)
     // Refresh source root dropdown (adds new root if this was a new directory)
     QMetaObject::invokeMethod(this, [this]{
         populateSourceRoots();
+        populateRebuildSourceRoots();
     }, Qt::QueuedConnection);
 }
 
@@ -869,6 +933,12 @@ void MainWindow::on_pushButtonStart_clicked()
         QMessageBox::information(this, "Backup", "Backup is already running.");
         return;
     }
+    if (rebuildFuture.isRunning()) {
+        QMessageBox::information(this, "Backup",
+            "Rebuild is currently running on the Rebuild from Source tab — stop it first. "
+            "Backup and Rebuild never run at the same time (they'd compete for the same RAM budget).");
+        return;
+    }
 
     // Capture UI values on the main thread before handing off to the background thread
     QString prefix = ui->lineEditPrefix->text().trimmed();
@@ -899,6 +969,7 @@ void MainWindow::on_pushButtonStart_clicked()
     ui->pushButtonUseSqlite->setEnabled(false);
     ui->pushButtonUseMariaDb->setEnabled(false);
     ui->lineEditLtfsOverhead->setEnabled(false);
+    ui->pushButtonStartRebuild->setEnabled(false);   // mutual exclusion with the Rebuild tab
     ui->labelBackupStatus->setText("Starting…");
     ui->progressBarBackup->setValue(0);
     ui->progressBarBackup->setMaximum(100);
@@ -1020,6 +1091,10 @@ void MainWindow::runBackup(const QString& prefix, qint64 maxFolderSize, qint64 l
             ui->pushButtonUseSqlite->setEnabled(true);
             ui->pushButtonUseMariaDb->setEnabled(true);
             ui->lineEditLtfsOverhead->setEnabled(true);
+            // Restore the Rebuild tab's Start button — its own click handler
+            // validates whether a scanned manifest is actually ready, same
+            // as every other "enabled broadly, validated on click" button.
+            ui->pushButtonStartRebuild->setEnabled(true);
             if (m_pipelineTimer) {
                 m_pipelineTimer->stop();
                 m_pipelineTimer->deleteLater();
@@ -2560,6 +2635,7 @@ void MainWindow::switchActiveBackend(DbBackend::Kind kind)
     }
     updateBackendButtons();
     populateSourceRoots();
+    populateRebuildSourceRoots();
 }
 
 void MainWindow::updateBackendButtons()
@@ -2632,4 +2708,546 @@ void MainWindow::on_lineEditLtfsOverhead_textChanged(const QString &arg1)
     bool ok;
     qint64 v = arg1.toLongLong(&ok);
     if (ok && v >= 0 && v <= 1048576) settings.setValue(kLtfsOverheadSettingsKey, arg1);
+}
+
+// ---------------------------------------------------------------------------
+// Rebuild from Source
+//
+// Disaster recovery for tapes that failed to restore: pick a tape (or
+// several) recorded in the done table, find out — read-only — exactly
+// which source files were backed up onto it, check which of those source
+// files still actually exist, and re-run the same read/compress/write
+// pipeline into a destination chosen here, never the live backup's
+// destinationdir and never the currently-incrementing tape sequence.
+//
+// The database is never written to by any function in this section. Resume
+// after a stop is filesystem-based (does the output file already exist at
+// the recorded size?) because that's the only kind of resume possible
+// under that constraint.
+// ---------------------------------------------------------------------------
+
+void MainWindow::populateRebuildSourceRoots()
+{
+    QThreadPool::globalInstance()->start([this]() {
+        QStringList roots;
+        if (m_db) {
+            QueryHeartbeat hb("populateRebuildSourceRoots: SELECT DISTINCT source_root");
+            roots = m_db->sourceRoots();
+        }
+        QMetaObject::invokeMethod(this, [this, roots]() {
+            QString prev = ui->comboBoxRebuildSourceRoot->currentText();
+            ui->comboBoxRebuildSourceRoot->blockSignals(true);
+            ui->comboBoxRebuildSourceRoot->clear();
+            for (const QString& r : roots) ui->comboBoxRebuildSourceRoot->addItem(r);
+            int idx = ui->comboBoxRebuildSourceRoot->findText(prev);
+            ui->comboBoxRebuildSourceRoot->setCurrentIndex(idx >= 0 ? idx : 0);
+            ui->comboBoxRebuildSourceRoot->blockSignals(false);
+        }, Qt::QueuedConnection);
+    });
+}
+
+void MainWindow::setRebuildControlsEnabled(bool en)
+{
+    ui->comboBoxRebuildSourceRoot->setEnabled(en);
+    ui->pushButtonRefreshTapeList->setEnabled(en);
+    ui->listWidgetTapes->setEnabled(en);
+    ui->pushButtonRebuildDest->setEnabled(en);
+    ui->pushButtonScanRebuild->setEnabled(en);
+}
+
+void MainWindow::on_comboBoxRebuildSourceRoot_currentIndexChanged(int /*index*/)
+{
+    // Scope changed — whatever was scanned no longer applies.
+    ui->listWidgetTapes->clear();
+    ui->labelRebuildSummary->setText("");
+    ui->plainTextEditMissing->clear();
+    ui->pushButtonSaveMissingList->setEnabled(false);
+    ui->pushButtonStartRebuild->setEnabled(false);
+    m_rebuildManifest.clear();
+    ui->labelScanRebuildStatus->setText(
+        "Pick a source root, check at least one tape, and set a destination.");
+}
+
+void MainWindow::on_pushButtonRefreshTapeList_clicked()
+{
+    if (!m_db) { QMessageBox::critical(this, "Error", "Session database not open."); return; }
+    QString sourceRoot = ui->comboBoxRebuildSourceRoot->currentText();
+    if (sourceRoot.isEmpty()) {
+        QMessageBox::critical(this, "Error", "Select a source root first.");
+        return;
+    }
+    ui->pushButtonRefreshTapeList->setEnabled(false);
+    ui->listWidgetTapes->clear();
+    QThreadPool::globalInstance()->start([this, sourceRoot]() {
+        QElapsedTimer t; t.start();
+        QVector<TapeInfo> tapes;
+        {
+            QueryHeartbeat hb(QString("listTapesForSource(%1)").arg(sourceRoot));
+            tapes = m_db->listTapesForSource(sourceRoot);
+        }
+        qDebug() << "[REBUILD] listTapesForSource(" << sourceRoot << ") found" << tapes.size()
+                 << "tape(s), took" << t.elapsed() << "ms";
+        QMetaObject::invokeMethod(this, [this, tapes]() {
+            ui->listWidgetTapes->clear();
+            for (const TapeInfo& ti : tapes) {
+                QString label = QString("%1  —  %2 files, %3")
+                    .arg(ti.tapeName)
+                    .arg(QLocale().toString(ti.fileCount))
+                    .arg(QLocale().formattedDataSize(ti.gzBytesSum, 2, QLocale::DataSizeSIFormat));
+                auto* item = new QListWidgetItem(label, ui->listWidgetTapes);
+                item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
+                item->setCheckState(Qt::Unchecked);
+                item->setData(Qt::UserRole, ti.tapeName);
+            }
+            ui->pushButtonRefreshTapeList->setEnabled(true);
+            ui->labelRebuildSourceStats->setText(
+                QString("%1 tape(s) on record for this source").arg(tapes.size()));
+        }, Qt::QueuedConnection);
+    });
+}
+
+void MainWindow::on_pushButtonRebuildDest_clicked()
+{
+    QFileDialog dialog(this);
+    dialog.setOptions(QFileDialog::HideNameFilterDetails | QFileDialog::DontUseNativeDialog);
+    dialog.setFileMode(QFileDialog::Directory);
+    dialog.setLabelText(QFileDialog::FileName,
+        "Destination for rebuild output (deliberately separate from the live backup destination)");
+    dialog.setDirectory(rebuildDestDir.path());
+    if (!dialog.exec()) return;
+    QStringList sel = dialog.selectedFiles();
+    if (sel.isEmpty()) return;
+
+    rebuildDestDir.setPath(sel[0]);
+    ui->labelRebuildDest->setText(rebuildDestDir.path());
+}
+
+void MainWindow::on_pushButtonScanRebuild_clicked()
+{
+    if (!m_db) { QMessageBox::critical(this, "Error", "Session database not open."); return; }
+    QString sourceRoot = ui->comboBoxRebuildSourceRoot->currentText();
+    if (sourceRoot.isEmpty() || !QDir(sourceRoot).exists()) {
+        QMessageBox::critical(this, "Error", "Select a valid source root first.");
+        return;
+    }
+    QStringList tapeNames;
+    for (int i = 0; i < ui->listWidgetTapes->count(); ++i) {
+        QListWidgetItem* item = ui->listWidgetTapes->item(i);
+        if (item->checkState() == Qt::Checked)
+            tapeNames << item->data(Qt::UserRole).toString();
+    }
+    if (tapeNames.isEmpty()) {
+        QMessageBox::critical(this, "Error", "Check at least one tape to rebuild.");
+        return;
+    }
+    if (rebuildDestDir.path().isEmpty() || !rebuildDestDir.exists()) {
+        QMessageBox::critical(this, "Error", "Select a valid destination for rebuild output first.");
+        return;
+    }
+    if (rebuildScanFuture.isRunning() || rebuildFuture.isRunning()) return;
+
+    stopRequested.store(false);
+    setRebuildControlsEnabled(false);
+    ui->pushButtonStartRebuild->setEnabled(false);
+    ui->pushButtonSaveMissingList->setEnabled(false);
+    ui->plainTextEditMissing->clear();
+    ui->labelRebuildSummary->setText("");
+    m_rebuildManifest.clear();
+
+    rebuildScanFuture = QtConcurrent::run([this, sourceRoot, tapeNames]() {
+        runRebuildScan(sourceRoot, tapeNames);
+    });
+}
+
+void MainWindow::runRebuildScan(const QString& sourceRoot, const QStringList& tapeNames)
+{
+    qDebug() << "[REBUILD-SCAN] starting — source:" << sourceRoot << "tapes:" << tapeNames;
+    QElapsedTimer timer; timer.start();
+
+    std::vector<RebuildManifestItem> manifest;
+    qint64 totalBytesManifest = 0, foundBytes = 0, missingBytes = 0;
+    int foundCount = 0, missingCount = 0;
+    QStringList missingLines;
+
+    for (const QString& tapeName : tapeNames) {
+        if (stopRequested.load()) break;
+        QString pattern = tapeName + "/%";
+        QVector<DoneVerifyItem> rows;
+        {
+            QueryHeartbeat hb(QString("Rebuild scan: loadDoneForVerification(%1)").arg(tapeName));
+            rows = m_db->loadDoneForVerification(sourceRoot, pattern);
+        }
+        qDebug() << "[REBUILD-SCAN]" << tapeName << "—" << rows.size()
+                 << "manifest rows from done table (read-only)";
+
+        QMetaObject::invokeMethod(this, [this, tapeName, n = rows.size()] {
+            ui->labelScanRebuildStatus->setText(
+                QString("%1: checking %2 files against source…").arg(tapeName).arg(n));
+        }, Qt::QueuedConnection);
+
+        int checked = 0;
+        qint64 lastLogMs = 0;
+        for (const DoneVerifyItem& row : rows) {
+            if (stopRequested.load()) break;
+            RebuildManifestItem item;
+            item.src           = row.src;
+            item.tapeName      = tapeName;
+            item.bytes         = row.bytes;
+            item.gzBytes       = row.gzBytes;
+            item.foundOnSource = QFileInfo::exists(sourceRoot + "/" + row.src);
+
+            totalBytesManifest += item.bytes;
+            if (item.foundOnSource) { ++foundCount; foundBytes += item.bytes; }
+            else { ++missingCount; missingBytes += item.bytes; missingLines << (tapeName + "/" + item.src); }
+
+            manifest.push_back(item);
+            ++checked;
+
+            qint64 nowMs = timer.elapsed();
+            if (nowMs - lastLogMs >= 2000 || checked == rows.size()) {
+                lastLogMs = nowMs;
+                qDebug() << "[REBUILD-SCAN]" << tapeName << "checked" << checked << "/" << rows.size()
+                         << "| found=" << foundCount << "missing=" << missingCount
+                         << "| elapsed=" << QString::number(nowMs / 1000.0, 'f', 1) << "s";
+                int checkedCopy = checked; int totalCopy = rows.size();
+                QMetaObject::invokeMethod(this, [this, tapeName, checkedCopy, totalCopy] {
+                    ui->labelScanRebuildStatus->setText(
+                        QString("%1: %2 / %3 checked").arg(tapeName).arg(checkedCopy).arg(totalCopy));
+                }, Qt::QueuedConnection);
+            }
+        }
+    }
+
+    double totalS = timer.elapsed() / 1000.0;
+    bool stopped = stopRequested.load();
+    qDebug() << "[REBUILD-SCAN]" << (stopped ? "stopped:" : "complete:") << manifest.size() << "files |"
+             << "found=" << foundCount << "(" << QLocale().formattedDataSize(foundBytes) << ")"
+             << "missing=" << missingCount << "(" << QLocale().formattedDataSize(missingBytes) << ")"
+             << "| took" << QString::number(totalS, 'f', 1) << "s";
+
+    QString summary = QString(
+        "Manifest: %1 files (%2)   |   Found on source: %3 (%4)   |   Missing: %5 (%6)   |   %7 s%8")
+        .arg(QLocale().toString((qint64)manifest.size()))
+        .arg(QLocale().formattedDataSize(totalBytesManifest, 2, QLocale::DataSizeSIFormat))
+        .arg(QLocale().toString(foundCount))
+        .arg(QLocale().formattedDataSize(foundBytes, 2, QLocale::DataSizeSIFormat))
+        .arg(QLocale().toString(missingCount))
+        .arg(QLocale().formattedDataSize(missingBytes, 2, QLocale::DataSizeSIFormat))
+        .arg(QString::number(totalS, 'f', 1))
+        .arg(stopped ? "  (stopped early — partial)" : "");
+
+    QString missingText = missingLines.join("\n");
+
+    QMetaObject::invokeMethod(this, [this, manifest, summary, missingText, foundCount, stopped] {
+        m_rebuildManifest.assign(manifest.begin(), manifest.end());
+        ui->labelRebuildSummary->setText(summary);
+        ui->plainTextEditMissing->setPlainText(missingText);
+        ui->pushButtonSaveMissingList->setEnabled(!missingText.isEmpty());
+        ui->pushButtonStartRebuild->setEnabled(foundCount > 0);
+        ui->labelScanRebuildStatus->setText(stopped ? "Scan stopped." : "Scan complete.");
+        setRebuildControlsEnabled(true);
+    }, Qt::QueuedConnection);
+}
+
+void MainWindow::on_pushButtonSaveMissingList_clicked()
+{
+    QString path = QFileDialog::getSaveFileName(this, "Save missing file list",
+        QDir::homePath() + "/missing_files.txt", "Text files (*.txt)", nullptr,
+        QFileDialog::DontUseNativeDialog);
+    if (path.isEmpty()) return;
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        QMessageBox::critical(this, "Error", "Could not write to " + path);
+        return;
+    }
+    f.write(ui->plainTextEditMissing->toPlainText().toUtf8());
+    f.close();
+    QMessageBox::information(this, "Saved", "Missing file list saved to:\n" + path);
+}
+
+void MainWindow::on_pushButtonStartRebuild_clicked()
+{
+    if (!m_db) { QMessageBox::critical(this, "Error", "Session database not open."); return; }
+    if (m_rebuildManifest.empty()) {
+        QMessageBox::critical(this, "Error", "Run Scan first.");
+        return;
+    }
+    if (backupFuture.isRunning()) {
+        QMessageBox::information(this, "Rebuild",
+            "A backup is currently running on the Backup tab — stop it first. "
+            "Backup and Rebuild never run at the same time (they'd compete for the same RAM budget).");
+        return;
+    }
+    if (rebuildFuture.isRunning()) {
+        QMessageBox::information(this, "Rebuild", "Rebuild is already running.");
+        return;
+    }
+    QString sourceRoot = ui->comboBoxRebuildSourceRoot->currentText();
+    QString outputBase = rebuildDestDir.path();
+    if (sourceRoot.isEmpty() || outputBase.isEmpty() || !QDir(outputBase).exists()) {
+        QMessageBox::critical(this, "Error", "Source root and destination must be set.");
+        return;
+    }
+
+    stopRequested.store(false);
+    ui->pushButtonStartRebuild->setEnabled(false);
+    ui->pushButtonStopRebuild->setEnabled(true);
+    ui->pushButtonStart->setEnabled(false);   // mutual exclusion with the Backup tab
+    setRebuildControlsEnabled(false);
+    ui->labelRebuildStatus->setText("Starting…");
+    ui->progressBarRebuild->setValue(0);
+
+    rebuildFuture = QtConcurrent::run([this, sourceRoot, outputBase]() {
+        runRebuild(sourceRoot, outputBase);
+    });
+}
+
+void MainWindow::on_pushButtonStopRebuild_clicked()
+{
+    stopRequested.store(true);
+    ui->pushButtonStopRebuild->setEnabled(false);
+    qDebug() << "[REBUILD] Stop button clicked";
+}
+
+void MainWindow::runRebuild(const QString& sourceRoot, const QString& outputBase)
+{
+    qDebug() << "[REBUILD] ── starting — source:" << sourceRoot << "output:" << outputBase
+             << "(database will not be written to) ──────────────────────";
+
+    // Only the files the scan actually found on source — the missing ones
+    // are already surfaced in plainTextEditMissing, nothing to attempt here.
+    std::vector<RebuildManifestItem> work;
+    for (const auto& item : m_rebuildManifest) if (item.foundOnSource) work.push_back(item);
+    int total = (int)work.size();
+    qDebug() << "[REBUILD]" << total << "files to attempt (" << m_rebuildManifest.size() - work.size()
+             << "missing, skipped)";
+
+    QMetaObject::invokeMethod(this, [this, total] {
+        ui->progressBarRebuild->setMaximum(qMax(total, 1));
+        ui->progressBarRebuild->setValue(0);
+    }, Qt::QueuedConnection);
+
+    int nThreads = qMax(1, QThread::idealThreadCount() - 1);
+
+    // Same RAM-budget formula as runBackup(): 32GB hard ceiling, 16GB
+    // safety margin below MemAvailable — this machine is shared, and that
+    // margin exists because of a real OOM investigation, not caution for
+    // its own sake. See mainwindow.cpp's runBackup() for the full history.
+    qint64 ramLimit = 32LL * 1024 * 1024 * 1024;
+    {
+        QFile mi("/proc/meminfo");
+        if (mi.open(QIODevice::ReadOnly)) {
+            for (QString line; !(line = mi.readLine()).isEmpty(); ) {
+                if (line.startsWith("MemAvailable:")) {
+                    qint64 kb = line.split(QRegularExpression("\\s+")).at(1).toLongLong();
+                    qint64 safe = kb * 1024 - 16LL*1024*1024*1024;
+                    ramLimit = qMin(ramLimit, qMax(512LL*1024*1024, safe));
+                    break;
+                }
+            }
+        }
+    }
+    qDebug() << "[REBUILD] threads:" << nThreads
+             << "ramLimit:" << QLocale().formattedDataSize(ramLimit, 2, QLocale::DataSizeSIFormat);
+
+    QThreadPool pool;
+    pool.setMaxThreadCount(nThreads);
+
+    QMutex              ramMutex;
+    QWaitCondition      ramCV;
+    std::atomic<qint64> ramInFlight{0};
+
+    std::atomic<int>    filesAttempted{0};
+    std::atomic<int>    filesRebuilt{0};
+    std::atomic<int>    filesSkippedExisting{0};
+    std::atomic<int>    filesFailed{0};
+    std::atomic<int>    activeReading{0};
+    std::atomic<int>    activeCompressing{0};
+    std::atomic<int>    activeWriting{0};
+    std::atomic<qint64> bytesWritten{0};
+    std::atomic<qint64> lastLogMs{0};
+    QElapsedTimer        totalTimer; totalTimer.start();
+
+    // Create + connect + start all inside one invokeMethod targeting the
+    // GUI thread, same structure as runBackup()'s m_pipelineTimer setup —
+    // connecting from a background thread before the timer exists (or
+    // starting it before connect() runs) would race the first tick.
+    QMetaObject::invokeMethod(this, [&] {
+        if (m_rebuildPipelineTimer) {
+            m_rebuildPipelineTimer->stop();
+            m_rebuildPipelineTimer->deleteLater();
+        }
+        m_rebuildPipelineTimer = new QTimer(this);
+        connect(m_rebuildPipelineTimer, &QTimer::timeout, this, [&] {
+            ui->labelReadCountRebuild->setText(QString::number(activeReading.load()));
+            ui->labelCompressCountRebuild->setText(QString::number(activeCompressing.load()));
+            ui->labelQueueCountRebuild->setText("—");
+            ui->labelWriteCountRebuild->setText(QString::number(activeWriting.load()));
+            ui->labelReadDetailRebuild->setText("NFS");
+            ui->labelCompressDetailRebuild->setText(
+                QLocale().formattedDataSize(ramInFlight.load(), 2, QLocale::DataSizeSIFormat)
+                + " / " + QLocale().formattedDataSize(ramLimit, 2, QLocale::DataSizeSIFormat) + " in RAM");
+            double elapsed = totalTimer.elapsed() / 1000.0;
+            int done = filesAttempted.load();
+            double fps = elapsed > 0 ? done / elapsed : 0;
+            ui->progressBarRebuild->setValue(done);
+            ui->labelRebuildStats->setText(
+                QString("done: %1 / %2  |  %3 files/s  |  written: %4  |  elapsed: %5 s")
+                    .arg(done).arg(total)
+                    .arg(QString::number(fps, 'f', 2))
+                    .arg(QLocale().formattedDataSize(bytesWritten.load(), 2, QLocale::DataSizeSIFormat))
+                    .arg(QString::number(elapsed, 'f', 0)));
+        });
+        m_rebuildPipelineTimer->start(250);
+    }, Qt::BlockingQueuedConnection);
+
+    for (const auto& item : work) {
+        if (stopRequested.load()) break;
+
+        // RAM budget gate, same 2x-reserve discipline as runBackup(): both
+        // the read buffer and the compressed-output buffer can be alive at
+        // once during compression, so reserve for both up front and settle
+        // down once the real compressed size is known (below).
+        {
+            QMutexLocker lk(&ramMutex);
+            while (ramInFlight.load() + 2 * item.bytes > ramLimit && !stopRequested.load())
+                ramCV.wait(&ramMutex, 200);
+        }
+        if (stopRequested.load()) break;
+
+        pool.start([this, item, sourceRoot, outputBase, &ramInFlight, &ramMutex, &ramCV,
+                    &filesAttempted, &filesRebuilt, &filesSkippedExisting, &filesFailed,
+                    &activeReading, &activeCompressing, &activeWriting, &bytesWritten,
+                    &lastLogMs, &totalTimer]() mutable {
+            QString destFile = outputBase + "/" + item.tapeName + "/" + item.src;
+            bool alreadyGz = QFileInfo(item.src).suffix().toLower() == "gz";
+            if (!alreadyGz) destFile += ".gz";
+
+            qint64 nowMs = totalTimer.elapsed();
+            qint64 prevLogMs = lastLogMs.load();
+            bool logThis = (nowMs - prevLogMs >= 2000)
+                && lastLogMs.compare_exchange_strong(prevLogMs, nowMs);
+
+            // Filesystem-based resume — the only kind possible without
+            // touching the database. Already-correct output is left alone.
+            QFileInfo destInfo(destFile);
+            if (destInfo.exists() && destInfo.size() == item.gzBytes) {
+                filesSkippedExisting.fetch_add(1);
+                filesAttempted.fetch_add(1);
+                if (logThis) qDebug() << "[REBUILD-SKIP] already present:" << destFile;
+                return;
+            }
+
+            ramInFlight.fetch_add(2 * item.bytes);
+            activeReading.fetch_add(1);
+            QString srcPath = sourceRoot + "/" + item.src;
+            QFile inF(srcPath);
+            if (!inF.open(QIODevice::ReadOnly)) {
+                activeReading.fetch_add(-1);
+                ramInFlight.fetch_add(-2 * item.bytes);
+                { QMutexLocker lk(&ramMutex); ramCV.wakeAll(); }
+                filesFailed.fetch_add(1);
+                filesAttempted.fetch_add(1);
+                qDebug() << "[REBUILD-FAILED] cannot open source:" << srcPath;
+                return;
+            }
+            QByteArray inputData = inF.readAll();
+            inF.close();
+            activeReading.fetch_add(-1);
+
+            if (inputData.isEmpty() && item.bytes > 0) {
+                ramInFlight.fetch_add(-2 * item.bytes);
+                { QMutexLocker lk(&ramMutex); ramCV.wakeAll(); }
+                filesFailed.fetch_add(1);
+                filesAttempted.fetch_add(1);
+                qDebug() << "[REBUILD-FAILED] empty read:" << srcPath;
+                return;
+            }
+
+            QByteArray gzData;
+            bool ok;
+            QString failReason;
+            if (alreadyGz) {
+                gzData = inputData;
+                ok = true;
+            } else {
+                activeCompressing.fetch_add(1);
+                ok = gzipCompress(inputData, &gzData, &failReason, this->stopRequested);
+                activeCompressing.fetch_add(-1);
+            }
+
+            qint64 keep = ok ? (qint64)gzData.size() : 0;
+            ramInFlight.fetch_add(keep - 2 * item.bytes);
+            { QMutexLocker lk(&ramMutex); ramCV.wakeAll(); }
+
+            if (!ok) {
+                filesFailed.fetch_add(1);
+                filesAttempted.fetch_add(1);
+                qDebug() << "[REBUILD-FAILED] compress:" << srcPath << failReason;
+                return;
+            }
+
+            activeWriting.fetch_add(1);
+            QDir().mkpath(QFileInfo(destFile).path());
+            bool writeOk = false;
+            QString closeErr;
+            {
+                QFile outF(destFile);
+                if (outF.open(QIODevice::WriteOnly)) {
+                    qint64 bytesWrittenNow = outF.write(gzData);
+                    outF.close();
+                    writeOk = (bytesWrittenNow == gzData.size()) && (outF.error() == QFile::NoError);
+                    if (!writeOk) closeErr = outF.errorString();
+                } else {
+                    closeErr = outF.errorString();
+                }
+            }
+            activeWriting.fetch_add(-1);
+            ramInFlight.fetch_add(-keep);
+            { QMutexLocker lk(&ramMutex); ramCV.wakeAll(); }
+
+            if (!writeOk) {
+                QFile::remove(destFile);
+                filesFailed.fetch_add(1);
+                filesAttempted.fetch_add(1);
+                qDebug() << "[REBUILD-FAILED] write failed:" << destFile << closeErr;
+                return;
+            }
+
+            filesRebuilt.fetch_add(1);
+            bytesWritten.fetch_add(gzData.size());
+            filesAttempted.fetch_add(1);
+            if (logThis) qDebug() << "[REBUILT] src=" << item.src << "dst=" << destFile
+                                   << "bytes=" << gzData.size() << "(NOT written to done table)";
+        });
+    }
+
+    pool.waitForDone();
+
+    QMetaObject::invokeMethod(this, [this] {
+        if (m_rebuildPipelineTimer) {
+            m_rebuildPipelineTimer->stop();
+            m_rebuildPipelineTimer->deleteLater();
+            m_rebuildPipelineTimer = nullptr;
+        }
+    }, Qt::BlockingQueuedConnection);
+
+    double totalS = totalTimer.elapsed() / 1000.0;
+    bool stopped = stopRequested.load();
+    QString summary = QString(
+        "%1 — rebuilt: %2  |  already present: %3  |  failed: %4  |  %5 / %6 attempted  |  %7 s")
+        .arg(stopped ? "Stopped" : "Complete")
+        .arg(filesRebuilt.load()).arg(filesSkippedExisting.load()).arg(filesFailed.load())
+        .arg(filesAttempted.load()).arg(total)
+        .arg(QString::number(totalS, 'f', 1));
+
+    qDebug() << "[REBUILD DONE]" << summary << "(nothing written to the done table this entire run)";
+
+    QMetaObject::invokeMethod(this, [this, summary] {
+        ui->labelRebuildStatus->setText(summary);
+        ui->pushButtonStartRebuild->setEnabled(true);
+        ui->pushButtonStopRebuild->setEnabled(false);
+        ui->pushButtonStart->setEnabled(!backupFuture.isRunning() && !scanFuture.isRunning());
+        setRebuildControlsEnabled(true);
+    }, Qt::QueuedConnection);
 }
